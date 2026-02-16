@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+faster-whisper
+requests
+ollama
+numpy>=2.0.0
+python-multipart
+sounddevice
+pyttsx3
+scipy
+google-auth-oauthlib
+google-auth-httplib2
+google-api-python-client
+python-dotenv

@@ -1,3 +1,9 @@
+import sys
+import os
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from voice.wake_word import listen_for_wake_word
 from voice.stt import listen_and_transcribe
 from voice.tts import speak
