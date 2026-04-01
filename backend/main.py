@@ -1,24 +1,42 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from pathlib import Path
 from llm.ollama_client import generate_response
 from llm.prompt import build_prompt
+from llm.hf_client import orchestrate
 from google_service.gmail_client import GmailClient
 from google_service.mail_generator import MailGenerator
+from google_service.travel_planner import plan_trip
 from intent_workflow import IntentClassifier, WorkflowExecutor, WorkflowTask
 from faster_whisper import WhisperModel
+import asyncio
 import tempfile
+import json
 from datetime import datetime
 import logging
 import os
 
 # Force CPU-only mode to avoid CUDA library issues
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
+# Allow OAuth over HTTP for local development
+os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
+
+# Load HuggingFace token from .env if present
+_env_file = Path(__file__).resolve().parent / ".env"
+if _env_file.exists():
+    for _line in _env_file.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _, _v = _line.partition("=")
+            os.environ.setdefault(_k.strip(), _v.strip())
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.DEBUG)
+
+# Frontend directory (used for serving static files and index.html)
+FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 
 app = FastAPI()
 
@@ -47,15 +65,20 @@ def get_model():
     return model
 
 def get_gmail_client():
+    """Get or create Gmail client. Returns None if not authenticated (needs OAuth)."""
     global gmail_client
     if gmail_client is None:
         try:
             gmail_client = GmailClient()
-            logger.info("Gmail client initialized")
+            logger.info("Gmail client created")
         except Exception as e:
-            logger.error(f"Failed to initialize Gmail client: {str(e)}")
+            logger.error(f"Failed to create Gmail client: {str(e)}")
+            gmail_client = None
             return None
-    return gmail_client
+    # If credentials expired, try to reload token (might have been refreshed)
+    if not gmail_client.is_authenticated():
+        gmail_client._try_load_token()
+    return gmail_client if gmail_client.is_authenticated() else gmail_client
 
 
 # ============ WORKFLOW TASKS ============
@@ -83,45 +106,87 @@ def task_create_google_meet(attendee_email: str, event_title: str, event_descrip
         raise
 
 
-def task_send_email(recipient_email: str, subject: str = "", body: str = "", use_llm: bool = False, 
-                    user_prompt: str = "", recipient_name: str = "", meeting_link: str = None, **kwargs) -> dict:
-    """Task: Send Email"""
+def task_send_email(recipient_email: str, subject: str = "", body: str = "",
+                    use_llm: bool = False, user_prompt: str = "",
+                    recipient_name: str = "", meeting_link: str = None,
+                    email_content: dict = None, **kwargs) -> dict:
+    """Task: Send Email — uses orchestrator pre-generated content when available."""
     try:
         client = get_gmail_client()
         if not client:
             raise Exception("Gmail client not initialized")
-        
+
         logger.info(f"Task: Sending email to {recipient_email}")
-        
-        # Generate content using LLM if requested
-        if use_llm and user_prompt:
-            logger.info("Generating email content with LLM")
+
+        # Priority: orchestrator content > explicit subject/body > LLM generation
+        if email_content and email_content.get("subject") and email_content.get("body"):
+            logger.info("Using orchestrator-generated email content")
+            subject = email_content["subject"]
+            body    = email_content["body"]
+            if meeting_link and meeting_link not in body:
+                body += f"\n\nGoogle Meet Link: {meeting_link}"
+        elif not subject or not body:
+            logger.info("Generating email content via MailGenerator")
             mail_content = MailGenerator.generate_mail_content(
-                user_prompt,
+                user_prompt or recipient_email,
                 recipient_name=recipient_name,
-                meeting_link=meeting_link
+                meeting_link=meeting_link,
+                prefilled=email_content
             )
-            subject = mail_content['subject']
-            body = mail_content['body']
-        
+            subject = mail_content["subject"]
+            body    = mail_content["body"]
+
         if not subject or not body:
             raise Exception("subject and body are required")
-        
-        logger.info(f"Sending email with subject: {subject}")
+
+        logger.info(f"Sending email — subject: {subject}")
         result = client.send_email(recipient_email, subject, body)
-        
-        if not result['success']:
+
+        if not result["success"]:
             raise Exception(f"Failed to send email: {result.get('error', 'Unknown error')}")
-        
+
         logger.info(f"Email sent successfully to {recipient_email}")
         return {
             "email_sent": True,
             "recipient": recipient_email,
-            "message_id": result.get('message_id')
+            "subject": subject,
+            "message_id": result.get("message_id")
         }
     except Exception as e:
         logger.error(f"Error in task_send_email: {str(e)}")
         raise
+
+
+def task_plan_travel(destination: str, origin: str = None, departure_date: str = None,
+                     return_date: str = None, travelers: int = None,
+                     preferences: list = None, travel_plan: dict = None, **kwargs) -> dict:
+    """Task: Return travel plan — uses orchestrator-generated plan when available."""
+    if travel_plan and travel_plan.get("itinerary"):
+        logger.info(f"Task: Using orchestrator travel plan for {destination}")
+        return {
+            "destination": destination,
+            "origin": origin,
+            "travel_plan": travel_plan
+        }
+    # Fallback: ask Ollama to generate a basic plan
+    logger.info(f"Task: Generating travel plan for {destination} via Ollama")
+    prompt = f"Create a concise travel itinerary for a trip to {destination}"
+    if origin:
+        prompt += f" from {origin}"
+    if departure_date:
+        prompt += f" departing {departure_date}"
+    if return_date:
+        prompt += f" returning {return_date}"
+    if travelers:
+        prompt += f" for {travelers} traveler(s)"
+    if preferences:
+        prompt += f". Preferences: {', '.join(preferences)}"
+    plan_text = generate_response(prompt)
+    return {
+        "destination": destination,
+        "origin": origin,
+        "travel_plan": {"itinerary": plan_text}
+    }
 
 
 def task_get_emails(max_results: int = 5, **kwargs) -> dict:
@@ -209,9 +274,19 @@ def register_workflows():
         )
     ])
     
-    # Workflow 6: General chat (no special workflow)
+    # Workflow 6: Travel planner
+    workflow_executor.register_workflow("travel_planner", [
+        WorkflowTask(
+            name="plan_travel",
+            function=task_plan_travel,
+            required_params=["destination"],
+            on_error="stop"
+        )
+    ])
+
+    # Workflow 7: General chat (no special workflow)
     workflow_executor.register_workflow("general_chat", [])
-    
+
     logger.info("All workflows registered successfully")
 
 
@@ -222,6 +297,38 @@ register_workflows()
 def serve_index():
     return FileResponse(FRONTEND_DIR / "index.html")
 
+@app.get("/auth/status")
+def auth_status():
+    """Check if Gmail is authenticated"""
+    client = get_gmail_client()
+    if client and client.is_authenticated():
+        return {"authenticated": True}
+    return {"authenticated": False, "auth_url": "/auth/login"}
+
+@app.get("/auth/login")
+def auth_login():
+    """Start OAuth flow — redirects browser to Google login"""
+    client = get_gmail_client()
+    if not client:
+        return {"error": "Gmail client could not be created"}
+    auth_url, state = client.get_auth_url()
+    return RedirectResponse(url=auth_url)
+
+@app.get("/auth/callback")
+def auth_callback(request: Request):
+    """OAuth callback — Google redirects here after login"""
+    try:
+        client = get_gmail_client()
+        if not client:
+            return {"error": "Gmail client could not be created"}
+        # Pass the full callback URL to exchange the code for tokens
+        client.handle_auth_callback(str(request.url))
+        logger.info("OAuth callback successful, redirecting to app")
+        return RedirectResponse(url="/")
+    except Exception as e:
+        logger.error(f"OAuth callback error: {str(e)}")
+        return {"error": f"Authentication failed: {str(e)}"}
+
 @app.get("/health")
 def health_check():
     return {"message": "Orbii Backend API is running", "status": "ok"}
@@ -231,23 +338,48 @@ def chat(message: dict):
     try:
         user_text = message["message"]
 
-        classification = IntentClassifier.classify(user_text)
-        intent = classification["intent"]
-        parameters = classification.get("parameters", {})
+        # ── Single-shot orchestration via gpraneeth555/llama-3-13k ──────────
+        classification  = IntentClassifier.classify(user_text)
+        intent          = classification["intent"]
+        parameters      = classification.get("parameters", {})
+        email_content   = classification.get("email_content", {})
+        travel_plan     = classification.get("travel_plan", {})
 
+        # Attach orchestrator outputs into parameters so workflow tasks receive them
+        if email_content and (email_content.get("subject") or email_content.get("body")):
+            parameters["email_content"] = email_content
+        if travel_plan and travel_plan.get("itinerary"):
+            parameters["travel_plan"] = travel_plan
+
+        # Cross-fill email ↔ attendee
+        if "attendee_email" in parameters and "recipient_email" not in parameters:
+            parameters["recipient_email"] = parameters["attendee_email"]
+        elif "recipient_email" in parameters and "attendee_email" not in parameters:
+            parameters["attendee_email"] = parameters["recipient_email"]
+
+        # ── general_chat ─────────────────────────────────────────────────────
         if intent == "general_chat":
             prompt = build_prompt(user_text)
-            reply = generate_response(prompt)
+            reply  = generate_response(prompt)
             return {"reply": reply, "intent": intent}
 
-        if intent in ("send_email", "meeting_and_email", "create_meeting", "schedule_meeting"):
-            return {
-                "reply": "Opening the email form for you.",
-                "intent": intent,
-                "parameters": parameters,
-                "action": "open_mail_modal"
-            }
+        # ── travel_planner ────────────────────────────────────────────────────
+        if intent == "travel_planner":
+            result = task_plan_travel(**parameters)
+            plan   = result.get("travel_plan", {})
+            dest   = result.get("destination", "your destination")
+            reply_parts = [f"Here's your travel plan for **{dest}**:"]
+            if plan.get("itinerary"):
+                reply_parts.append(plan["itinerary"])
+            if plan.get("recommendations"):
+                reply_parts.append("**Recommendations:** " + ", ".join(plan["recommendations"]))
+            if plan.get("budget_estimate"):
+                reply_parts.append(f"**Budget:** {plan['budget_estimate']}")
+            if plan.get("tips"):
+                reply_parts.append(f"**Tips:** {plan['tips']}")
+            return {"reply": "\n\n".join(reply_parts), "intent": intent}
 
+        # ── get_emails ────────────────────────────────────────────────────────
         if intent == "get_emails":
             result = task_get_emails(max_results=parameters.get("max_results", 10))
             return {
@@ -256,11 +388,305 @@ def chat(message: dict):
                 "emails": result["emails"]
             }
 
+        # Auto-upgrade create_meeting → meeting_and_email when email is present
+        if intent == "create_meeting" and (
+            parameters.get("attendee_email") or parameters.get("recipient_email")
+        ):
+            intent = "meeting_and_email"
+
+        # ── email / meeting intents — execute directly ────────────────────────
+        if intent in ("send_email", "meeting_and_email", "create_meeting", "schedule_meeting"):
+            recipient = parameters.get("recipient_email") or parameters.get("attendee_email", "")
+            if not recipient:
+                return {"reply": "Please mention the recipient's email address.", "intent": intent}
+
+            meet_link  = None
+            parts      = []
+
+            if intent in ("meeting_and_email", "create_meeting", "schedule_meeting"):
+                try:
+                    mr = task_create_google_meet(
+                        attendee_email=recipient,
+                        event_title=parameters.get("event_title", "Meeting"),
+                        event_description=parameters.get("event_description", ""),
+                    )
+                    meet_link = mr.get("meet_link")
+                    if meet_link:
+                        parts.append(f"**Google Meet created:** {meet_link}")
+                except Exception as e:
+                    parts.append(f"Meet creation failed: {e}")
+
+            if intent != "create_meeting":
+                try:
+                    er = task_send_email(
+                        recipient_email=recipient,
+                        email_content=email_content if email_content else None,
+                        meeting_link=meet_link,
+                        user_prompt=parameters.get("event_description", ""),
+                        recipient_name=parameters.get("recipient_name", recipient.split("@")[0]),
+                    )
+                    subj = (email_content or {}).get("subject") or er.get("subject", "")
+                    if er.get("email_sent"):
+                        parts.append(f"**Email sent** to {recipient}"
+                                     + (f"\n**Subject:** {subj}" if subj else ""))
+                    else:
+                        parts.append(f"Email failed: {er.get('error','unknown')}")
+                except Exception as e:
+                    parts.append(f"Email failed: {e}")
+
+            return {"reply": "\n\n".join(parts) or "Done.", "intent": intent}
+
+        # ── fallback ──────────────────────────────────────────────────────────
         prompt = build_prompt(user_text)
-        reply = generate_response(prompt)
+        reply  = generate_response(prompt)
         return {"reply": reply, "intent": intent}
+
     except Exception as e:
+        logger.error(f"Chat error: {e}", exc_info=True)
         return {"error": str(e), "reply": "Sorry, I encountered an error. Is Ollama running?"}
+
+
+@app.post("/chat/stream")
+async def chat_stream(message: dict):
+    """
+    Streaming chat endpoint — emits SSE events so the frontend can show
+    a live 'thinking' bubble with each processing step.
+
+    Event types:
+      thinking  → {type:"thinking", step:"..."}
+      response  → {type:"response", reply:"...", intent:"...", action?:"...", parameters?:{}}
+      error     → {type:"error", message:"..."}
+    """
+    user_text = message.get("message", "")
+    loop = asyncio.get_event_loop()
+
+    def _sse(obj: dict) -> str:
+        return f"data: {json.dumps(obj)}\n\n"
+
+    async def generate():
+        try:
+            yield _sse({"type": "thinking", "step": "Understanding your request…"})
+            await asyncio.sleep(0)
+
+            # ── Intent classification (blocking → executor) ─────────────────
+            classification = await loop.run_in_executor(
+                None, IntentClassifier.classify, user_text
+            )
+            intent       = classification["intent"]
+            parameters   = classification.get("parameters", {})
+            email_content = classification.get("email_content", {})
+            travel_plan_pre = classification.get("travel_plan", {})
+
+            intent_label = intent.replace("_", " ").title()
+            yield _sse({"type": "thinking", "step": f"Intent detected: {intent_label}"})
+            await asyncio.sleep(0)
+
+            # Cross-fill email ↔ attendee
+            if "attendee_email" in parameters and "recipient_email" not in parameters:
+                parameters["recipient_email"] = parameters["attendee_email"]
+            elif "recipient_email" in parameters and "attendee_email" not in parameters:
+                parameters["attendee_email"] = parameters["recipient_email"]
+
+            # Upgrade create_meeting → meeting_and_email when an email address is present
+            # (user said "meet with X@..." which implies sending an invite)
+            if intent == "create_meeting" and (
+                parameters.get("attendee_email") or parameters.get("recipient_email")
+            ):
+                intent = "meeting_and_email"
+                yield _sse({"type": "thinking",
+                            "step": "Attendee detected — will send invite email too"})
+                await asyncio.sleep(0)
+
+            if email_content and (email_content.get("subject") or email_content.get("body")):
+                parameters["email_content"] = email_content
+            if travel_plan_pre and travel_plan_pre.get("itinerary"):
+                parameters["travel_plan"] = travel_plan_pre
+
+            # ── general_chat ────────────────────────────────────────────────
+            if intent == "general_chat":
+                yield _sse({"type": "thinking", "step": "Generating response…"})
+                await asyncio.sleep(0)
+                prompt = build_prompt(user_text)
+                reply  = await loop.run_in_executor(None, generate_response, prompt)
+                yield _sse({"type": "response", "reply": reply, "intent": intent})
+                return
+
+            # ── travel_planner ──────────────────────────────────────────────
+            if intent == "travel_planner":
+                # We'll stream individual travel steps through a queue
+                step_queue = asyncio.Queue()
+                travel_result = {}
+
+                def _emit(step: str):
+                    asyncio.run_coroutine_threadsafe(
+                        step_queue.put(step), loop
+                    )
+
+                async def _run_plan():
+                    result = await loop.run_in_executor(
+                        None, lambda: plan_trip(user_text, emit=_emit)
+                    )
+                    await step_queue.put(None)  # sentinel
+                    return result
+
+                plan_task = asyncio.ensure_future(_run_plan())
+
+                # Drain step queue while planning runs
+                while True:
+                    step = await step_queue.get()
+                    if step is None:
+                        break
+                    yield _sse({"type": "thinking", "step": step})
+                    await asyncio.sleep(0)
+
+                travel_result = await plan_task
+
+                if "error" in travel_result:
+                    yield _sse({"type": "response",
+                                "reply": travel_result["error"],
+                                "intent": intent})
+                    return
+
+                # Build reply from result
+                dest      = travel_result["entities"].get("to_city", "your destination")
+                itinerary = travel_result.get("itinerary", "")
+                flights   = travel_result.get("flights", [])
+                hotels    = travel_result.get("hotels", [])
+                attrs     = travel_result.get("attractions", [])
+
+                parts = [f"## Travel Plan for {dest}\n"]
+                if flights:
+                    parts.append("**✈ Best Flight:** " +
+                        f"{flights[0]['currency']} {flights[0]['price']} | "
+                        f"{flights[0]['departure']}→{flights[0]['arrival']} | "
+                        f"{flights[0]['duration']}")
+                if hotels:
+                    parts.append("**🏨 Top Hotel:** " +
+                        f"{hotels[0]['name']} — {hotels[0]['currency']} {hotels[0]['price']}/night")
+                if attrs:
+                    top = ", ".join(a["name"] for a in attrs[:5])
+                    parts.append(f"**📍 Top Attractions:** {top}")
+                parts.append("\n### Itinerary\n" + itinerary)
+
+                yield _sse({"type": "response",
+                            "reply": "\n\n".join(parts),
+                            "intent": intent})
+                return
+
+            # ── get_emails ──────────────────────────────────────────────────
+            if intent == "get_emails":
+                yield _sse({"type": "thinking", "step": "Fetching your emails…"})
+                await asyncio.sleep(0)
+                result = await loop.run_in_executor(
+                    None, lambda: task_get_emails(max_results=parameters.get("max_results", 10))
+                )
+                yield _sse({"type": "response",
+                            "reply": f"Fetched {result['count']} emails.",
+                            "intent": intent,
+                            "emails": result["emails"]})
+                return
+
+            # ── email / meeting intents — execute directly, no modal ──────────
+            if intent in ("send_email", "meeting_and_email",
+                          "create_meeting", "schedule_meeting"):
+
+                recipient = (parameters.get("recipient_email")
+                             or parameters.get("attendee_email", ""))
+
+                if not recipient:
+                    yield _sse({"type": "response",
+                                "reply": "I couldn't find a recipient email address in your request. "
+                                         "Please mention the email address you'd like to contact.",
+                                "intent": intent})
+                    return
+
+                meet_link = None
+
+                # ── Step A: create Google Meet if needed ─────────────────────
+                if intent in ("meeting_and_email", "create_meeting", "schedule_meeting"):
+                    yield _sse({"type": "thinking", "step": "Creating Google Meet…"})
+                    await asyncio.sleep(0)
+                    try:
+                        meet_result = await loop.run_in_executor(
+                            None,
+                            lambda: task_create_google_meet(
+                                attendee_email=recipient,
+                                event_title=parameters.get("event_title", "Meeting"),
+                                event_description=parameters.get("event_description", ""),
+                                **{k: v for k, v in parameters.items()
+                                   if k not in ("attendee_email","event_title","event_description")}
+                            )
+                        )
+                        meet_link = meet_result.get("meet_link")
+                        yield _sse({"type": "thinking",
+                                    "step": f"Meet created: {meet_link}"})
+                        await asyncio.sleep(0)
+                    except Exception as e:
+                        yield _sse({"type": "thinking",
+                                    "step": f"Meet creation failed: {e}"})
+                        await asyncio.sleep(0)
+
+                # ── Step B: send email (skip for create_meeting only) ─────────
+                if intent != "create_meeting":
+                    yield _sse({"type": "thinking", "step": f"Sending email to {recipient}…"})
+                    await asyncio.sleep(0)
+                    try:
+                        email_result = await loop.run_in_executor(
+                            None,
+                            lambda: task_send_email(
+                                recipient_email=recipient,
+                                email_content=email_content if email_content else None,
+                                meeting_link=meet_link,
+                                user_prompt=parameters.get("event_description", "")
+                                            or parameters.get("body", ""),
+                                recipient_name=parameters.get("recipient_name",
+                                                              recipient.split("@")[0]),
+                                **{k: v for k, v in parameters.items()
+                                   if k not in ("recipient_email","email_content",
+                                                "meeting_link","user_prompt","recipient_name")}
+                            )
+                        )
+                        yield _sse({"type": "thinking", "step": "Email sent ✓"})
+                        await asyncio.sleep(0)
+                    except Exception as e:
+                        yield _sse({"type": "thinking",
+                                    "step": f"Email failed: {e}"})
+                        await asyncio.sleep(0)
+                        email_result = {"email_sent": False, "error": str(e)}
+
+                # ── Build reply ───────────────────────────────────────────────
+                parts = []
+                if meet_link:
+                    parts.append(f"**Google Meet created:** {meet_link}")
+                if intent != "create_meeting":
+                    subj = (email_content or {}).get("subject") or email_result.get("subject", "")
+                    sent_ok = email_result.get("email_sent", False)
+                    if sent_ok:
+                        parts.append(f"**Email sent** to {recipient}"
+                                     + (f"\n**Subject:** {subj}" if subj else ""))
+                    else:
+                        parts.append(f"Email to {recipient} failed: "
+                                     + email_result.get("error", "unknown error"))
+
+                yield _sse({"type": "response",
+                            "reply": "\n\n".join(parts) if parts else "Done.",
+                            "intent": intent})
+                return
+
+            # ── fallback ────────────────────────────────────────────────────
+            yield _sse({"type": "thinking", "step": "Generating response…"})
+            await asyncio.sleep(0)
+            prompt = build_prompt(user_text)
+            reply  = await loop.run_in_executor(None, generate_response, prompt)
+            yield _sse({"type": "response", "reply": reply, "intent": intent})
+
+        except Exception as e:
+            logger.error("Stream chat error: %s", e, exc_info=True)
+            yield _sse({"type": "error", "message": str(e)})
+
+    return StreamingResponse(generate(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
 
 
 @app.post("/process-intent")
@@ -452,9 +878,9 @@ async def get_latest_emails(max_results: int = 10):
     import asyncio
     try:
         client = get_gmail_client()
-        if not client:
-            return {"error": "Gmail client not initialized", "emails": []}
-        
+        if not client or not client.is_authenticated():
+            return {"error": "needs_auth", "auth_url": "/auth/login", "emails": []}
+
         loop = asyncio.get_event_loop()
         emails = await asyncio.wait_for(
             loop.run_in_executor(None, client.get_all_recent_emails, max_results),
@@ -465,8 +891,11 @@ async def get_latest_emails(max_results: int = 10):
         logger.error("Email fetch timed out after 20s")
         return {"error": "Gmail request timed out", "emails": []}
     except Exception as e:
-        logger.error(f"Error fetching emails: {str(e)}")
-        return {"success": False, "error": str(e), "emails": []}
+        err = str(e)
+        logger.error(f"Error fetching emails: {err}")
+        if "needs_auth" in err:
+            return {"error": "needs_auth", "auth_url": "/auth/login", "emails": []}
+        return {"success": False, "error": err, "emails": []}
 
 
 @app.post("/emails/send")
@@ -615,8 +1044,6 @@ def sms_ingest(payload: dict):
 
 
 # ============ SERVE FRONTEND ============
-FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
-
 app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 
 

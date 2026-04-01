@@ -1,90 +1,81 @@
-from llm.ollama_client import generate_response
-from llm.prompt import build_prompt
+"""
+Mail content generator.
+Prefers content already produced by the orchestrator (gpraneeth555/llama-3-13k).
+Falls back to a direct Ollama call only when no pre-generated content is available.
+"""
+
 import logging
+from llm.ollama_client import generate_response
 
 logger = logging.getLogger(__name__)
 
+
 class MailGenerator:
-    """Generate email subject and body using LLM"""
-    
+
     @staticmethod
-    def generate_mail_content(user_prompt, recipient_name=None, meeting_link=None):
+    def generate_mail_content(
+        user_prompt: str,
+        recipient_name: str = None,
+        meeting_link: str = None,
+        prefilled: dict = None          # ← content already from the HF orchestrator
+    ) -> dict:
         """
-        Generate email subject and body based on user prompt
-        
-        Args:
-            user_prompt: The user's intention for the email
-            recipient_name: Optional recipient name
-            meeting_link: Optional Google Meet link to include
-        
-        Returns:
-            dict with 'subject' and 'body' keys
+        Return {'subject': ..., 'body': ...}.
+
+        If `prefilled` dict already has both keys (from the orchestrator JSON),
+        those values are used directly — injecting the meeting_link if needed.
+        Otherwise a fresh Ollama call is made.
         """
+
+        # ── 1. Use orchestrator-generated content if available ──────────────
+        if prefilled:
+            subject = (prefilled.get("subject") or "").strip()
+            body    = (prefilled.get("body")    or "").strip()
+            if subject and body:
+                if meeting_link and meeting_link not in body:
+                    body += f"\n\nGoogle Meet Link: {meeting_link}"
+                logger.info("[MailGenerator] Using orchestrator-generated email content")
+                return {"subject": subject, "body": body}
+
+        # ── 2. Fallback — ask Ollama to generate subject + body ─────────────
+        logger.info("[MailGenerator] Generating email content via Ollama (fallback)")
         try:
-            # Build a structured prompt for the LLM
-            system_instruction = """You are an email content generator. Generate professional, concise email content.
-            Return response in this exact format:
-            SUBJECT: [email subject line]
-            BODY: [email body text]
-            
-            Keep the subject to one line. Keep the body concise but complete."""
-            
-            context = f"Generate an email for: {user_prompt}"
+            context_lines = [f"Generate a professional email for: {user_prompt}"]
             if recipient_name:
-                context += f"\nRecipient: {recipient_name}"
+                context_lines.append(f"Recipient: {recipient_name}")
             if meeting_link:
-                context += f"\nInclude this Google Meet link in the email: {meeting_link}"
-            
-            full_prompt = build_prompt(context)
-            
-            # Generate response
+                context_lines.append(f"Include this Google Meet link in the email: {meeting_link}")
+
+            system = (
+                "You are an email content generator. Return ONLY:\n"
+                "SUBJECT: <one-line subject>\n"
+                "BODY: <email body>"
+            )
+            full_prompt = system + "\n\n" + "\n".join(context_lines)
+
             response = generate_response(full_prompt)
-            
-            # Parse the response
+
             subject = ""
-            body = ""
-            
-            lines = response.split('\n')
+            body    = ""
+            lines   = response.split("\n")
             for i, line in enumerate(lines):
                 if line.startswith("SUBJECT:"):
                     subject = line.replace("SUBJECT:", "").strip()
                 elif line.startswith("BODY:"):
-                    body = '\n'.join(lines[i:]).replace("BODY:", "").strip()
+                    body = "\n".join(lines[i:]).replace("BODY:", "").strip()
                     break
-            
+
             if not subject or not body:
-                # Fallback if parsing fails
-                subject = "Meeting Request"
-                body = user_prompt
+                subject = "Meeting Request" if meeting_link else "Message from OrbixAI"
+                body    = user_prompt
                 if meeting_link:
                     body += f"\n\nGoogle Meet Link: {meeting_link}"
-            
-            logger.info(f"Email content generated successfully")
-            return {
-                'subject': subject,
-                'body': body
-            }
-        except Exception as e:
-            logger.error(f"Error generating email content: {str(e)}")
-            return {
-                'subject': 'Meeting Request',
-                'body': 'Please join our meeting.'
-            }
 
-    @staticmethod
-    def generate_meeting_invitation(recipient_name, meeting_time=None, meeting_purpose=None):
-        """Generate a professional meeting invitation"""
-        try:
-            prompt = f"Generate a professional meeting invitation email to {recipient_name}"
-            if meeting_time:
-                prompt += f" for {meeting_time}"
-            if meeting_purpose:
-                prompt += f" about {meeting_purpose}"
-            
-            return MailGenerator.generate_mail_content(prompt, recipient_name)
+            return {"subject": subject, "body": body}
+
         except Exception as e:
-            logger.error(f"Error generating meeting invitation: {str(e)}")
+            logger.error(f"[MailGenerator] Error generating content: {e}")
             return {
-                'subject': f'Meeting Invitation - {meeting_purpose or "Discussion"}',
-                'body': f'Hi {recipient_name},\n\nI would like to schedule a meeting with you.\n\nBest regards'
+                "subject": "Meeting Invitation" if meeting_link else "Message from OrbixAI",
+                "body":    user_prompt + (f"\n\nMeet: {meeting_link}" if meeting_link else "")
             }

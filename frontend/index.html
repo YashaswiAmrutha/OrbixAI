@@ -1,154 +1,179 @@
 <!DOCTYPE html>
 <html lang="en">
-
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>OrbixAI - Assistant</title>
+  <title>OrbixAI</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,300..700;1,14..32,300..700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css?v=8" />
 </head>
-
 <body>
-  <div class="layout-wrapper">
+  <div class="app-shell">
 
-    <div class="app-container">
-      <header class="header">
-        <div class="header-content">
-          <div class="header-title">
-            <h1>OrbixAI</h1>
-            <p class="header-subtitle">Your intelligent assistant</p>
+    <!-- ===== LEFT PANEL ===== -->
+    <aside class="left-panel">
+      <div class="panel-logo">
+        <div class="logo-mark">O</div>
+      </div>
+
+      <!-- Calendar Widget -->
+      <div class="widget" id="calendar-widget">
+        <div class="widget-header">
+          <span class="widget-title">Calendar</span>
+          <div class="cal-nav">
+            <button class="cal-nav-btn" id="cal-prev">&#8249;</button>
+            <button class="cal-nav-btn" id="cal-next">&#8250;</button>
           </div>
-          <div class="header-right">
-            <button class="icon-btn" id="voice-mute-btn" title="Toggle voice reply">
-              <svg class="voice-icon voice-icon-on" width="18" height="18" viewBox="0 0 24 24" fill="none"
-                stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <rect x="9" y="2" width="6" height="11" rx="3"></rect>
-                <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
-                <line x1="12" y1="19" x2="12" y2="22"></line>
-                <line x1="8" y1="22" x2="16" y2="22"></line>
-              </svg>
-              <svg class="voice-icon voice-icon-off" width="18" height="18" viewBox="0 0 24 24" fill="none"
-                stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <rect x="9" y="2" width="6" height="11" rx="3"></rect>
-                <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
-                <line x1="12" y1="19" x2="12" y2="22"></line>
-                <line x1="8" y1="22" x2="16" y2="22"></line>
-                <line class="strike-line" x1="2" y1="2" x2="22" y2="22"></line>
-              </svg>
-            </button>
-            <button class="icon-btn" id="theme-toggle" title="Toggle theme">
-              <svg class="theme-icon theme-icon-sun" width="18" height="18" viewBox="0 0 24 24" fill="none"
-                stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <circle cx="12" cy="12" r="5"></circle>
-                <line x1="12" y1="1" x2="12" y2="3"></line>
-                <line x1="12" y1="21" x2="12" y2="23"></line>
-                <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line>
-                <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>
-                <line x1="1" y1="12" x2="3" y2="12"></line>
-                <line x1="21" y1="12" x2="23" y2="12"></line>
-                <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line>
-                <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
-              </svg>
-              <svg class="theme-icon theme-icon-moon" width="18" height="18" viewBox="0 0 24 24" fill="none"
-                stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
-              </svg>
-            </button>
-          </div>
+        </div>
+        <div class="cal-month-label" id="cal-month-label"></div>
+        <div class="cal-grid" id="cal-grid"></div>
+      </div>
+
+      <!-- Upcoming / Info Widget -->
+      <div class="widget widget-info">
+        <div class="widget-header">
+          <span class="widget-title">Today</span>
+        </div>
+        <div class="today-info" id="today-info">
+          <div class="today-date" id="today-date"></div>
+          <div class="today-day" id="today-day"></div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- ===== CENTER: CHAT ===== -->
+    <main class="chat-main">
+      <header class="chat-header">
+        <div class="chat-header-title">
+          <h1>OrbixAI</h1>
+          <p>Your intelligent assistant</p>
+        </div>
+        <div class="chat-header-controls">
+          <button class="ctrl-btn btn-voice" id="mic-btn" title="Voice input">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="9" y="2" width="6" height="11" rx="3"></rect>
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+              <line x1="12" y1="19" x2="12" y2="22"></line>
+              <line x1="8" y1="22" x2="16" y2="22"></line>
+            </svg>
+          </button>
+          <button class="ctrl-btn" id="voice-mute-btn" title="Toggle voice reply">
+            <svg class="icon-sound-on" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+              <path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path>
+              <path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+            </svg>
+            <svg class="icon-sound-off" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+              <line x1="23" y1="9" x2="17" y2="15"></line>
+              <line x1="17" y1="9" x2="23" y2="15"></line>
+            </svg>
+          </button>
+          <button class="ctrl-btn" id="theme-toggle" title="Toggle theme">
+            <svg class="icon-sun" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="5"></circle>
+              <line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line>
+              <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>
+              <line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line>
+              <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
+            </svg>
+            <svg class="icon-moon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+            </svg>
+          </button>
         </div>
       </header>
 
       <div class="chat-container" id="chat-container"></div>
 
       <div class="input-area">
-        <input type="text" id="user-input" placeholder="Type your message here..." autocomplete="off" />
-        <button class="icon-btn btn-voice" id="mic-btn" title="Send voice message">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-            stroke-linecap="round" stroke-linejoin="round">
-            <rect x="9" y="2" width="6" height="11" rx="3"></rect>
-            <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
-            <line x1="12" y1="19" x2="12" y2="22"></line>
-            <line x1="8" y1="22" x2="16" y2="22"></line>
-          </svg>
-        </button>
-        <button class="icon-btn btn-send" id="send-btn" title="Send message">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-            stroke-linecap="round" stroke-linejoin="round">
-            <line x1="22" y1="2" x2="11" y2="13"></line>
-            <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
-          </svg>
-        </button>
+        <div class="input-wrapper">
+          <input type="text" id="user-input" placeholder="Ask OrbixAI anything…" autocomplete="off" />
+          <button class="send-btn" id="send-btn" title="Send">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="22" y1="2" x2="11" y2="13"></line>
+              <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+            </svg>
+          </button>
+        </div>
       </div>
-    </div>
+    </main>
 
-    <div class="email-sidebar" id="floating-mail-widget">
-      <div class="mail-container" id="mail-container">
-        <div class="mail-header">
-          <div class="mail-header-left">
-            <span class="mail-title">Emails</span>
-            <span class="mail-auto-update" id="mail-auto-update" title="Auto-updating emails">&#9679;</span>
+    <!-- ===== RIGHT PANEL ===== -->
+    <aside class="right-panel">
+
+      <!-- Email Widget (top) -->
+      <div class="right-widget email-section" id="mail-container">
+        <div class="widget-header">
+          <div class="widget-header-left">
+            <span class="widget-title">Emails</span>
+            <span class="mail-dot" id="mail-auto-update">&#9679;</span>
           </div>
-          <div class="mail-header-right">
-            <button class="mail-refresh-btn" id="mail-refresh-btn" title="Refresh emails manually">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-                stroke-linecap="round" stroke-linejoin="round">
-                <path d="M21.5 2v6h-6"></path>
-                <path d="M2.5 22v-6h6"></path>
-                <path d="M2 11.5a10 10 0 0 1 18.8-4.3"></path>
-                <path d="M22 12.5a10 10 0 0 1-18.8 4.3"></path>
+          <div class="widget-header-right">
+            <button class="icon-action-btn" id="mail-refresh-btn" title="Refresh">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21.5 2v6h-6"></path><path d="M2.5 22v-6h6"></path>
+                <path d="M2 11.5a10 10 0 0 1 18.8-4.3"></path><path d="M22 12.5a10 10 0 0 1-18.8 4.3"></path>
               </svg>
             </button>
-            <button class="mail-toggle-btn" id="mail-toggle-btn" title="Toggle emails">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
-                stroke-linecap="round" stroke-linejoin="round">
+            <button class="icon-action-btn" id="mail-toggle-btn" title="Collapse">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M15 18l-6-6 6-6"></path>
               </svg>
             </button>
           </div>
         </div>
         <div class="mail-list" id="mail-list">
-          <div class="mail-item placeholder">
-            <p>Loading emails...</p>
-          </div>
+          <div class="mail-item placeholder"><p>Loading emails…</p></div>
         </div>
       </div>
-    </div>
 
+      <!-- To-Do Widget (bottom) -->
+      <div class="right-widget todo-section">
+        <div class="widget-header">
+          <span class="widget-title">To-Do</span>
+          <span class="todo-count" id="todo-count">0</span>
+        </div>
+        <div class="todo-input-row">
+          <input type="text" id="todo-input" placeholder="Add a task…" maxlength="80" />
+          <button class="todo-add-btn" id="todo-add-btn">+</button>
+        </div>
+        <div class="todo-list" id="todo-list"></div>
+      </div>
+
+    </aside>
   </div>
 
+  <!-- Email Compose Modal -->
   <div class="modal" id="mail-modal">
     <div class="modal-content">
       <div class="modal-header">
-        <h2>Send Email & Create Meeting</h2>
+        <h2>Send Email &amp; Create Meeting</h2>
         <button class="modal-close" id="modal-close">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-            stroke-linecap="round" stroke-linejoin="round">
-            <line x1="18" y1="6" x2="6" y2="18"></line>
-            <line x1="6" y1="6" x2="18" y2="18"></line>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line>
           </svg>
         </button>
       </div>
       <div class="modal-body">
         <form id="mail-form">
           <div class="form-group">
-            <label for="recipient-email">Recipient Email:</label>
-            <input type="email" id="recipient-email" required />
+            <label for="recipient-email">Recipient Email</label>
+            <input type="email" id="recipient-email" placeholder="name@example.com" required />
           </div>
           <div class="form-group">
-            <label for="mail-prompt">Email Purpose/Prompt:</label>
-            <textarea id="mail-prompt" placeholder="e.g., Schedule a meeting to discuss project roadmap"
-              rows="4"></textarea>
+            <label for="mail-prompt">Email Purpose / Prompt</label>
+            <textarea id="mail-prompt" placeholder="e.g., Schedule a meeting to discuss the roadmap" rows="4"></textarea>
           </div>
           <div class="form-group checkbox">
             <input type="checkbox" id="create-meet" checked />
-            <label for="create-meet">Create Google Meet</label>
+            <label for="create-meet">Create Google Meet link</label>
           </div>
           <div class="form-group checkbox">
             <input type="checkbox" id="use-llm" checked />
-            <label for="use-llm">Generate subject & body with AI</label>
+            <label for="use-llm">Generate subject &amp; body with AI</label>
           </div>
           <div class="form-actions">
             <button type="submit" class="btn btn-primary">Send Email</button>
@@ -158,10 +183,8 @@
       </div>
     </div>
   </div>
-
   <div class="modal-overlay" id="modal-overlay"></div>
 
-  <script src="/static/script.js"></script>
+  <script src="/static/script.js?v=7"></script>
 </body>
-
 </html>
