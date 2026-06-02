@@ -3,6 +3,7 @@ const API_BASE = window.location.protocol === "file:"
   : "";
 
 // ── Core state ───────────────────────────────────────────────────────────────
+// ── Core state ───────────────────────────────────────────────────────────────
 let mediaRecorder;
 let audioChunks  = [];
 let isRecording  = false;
@@ -1159,6 +1160,242 @@ function renderTodayAgenda() {
   }).join("") + (evs.length > 4 ? `<div class="today-agenda-empty">+${evs.length - 4} more…</div>` : "");
 }
 
+// ── INTEGRATIONS (MCP) ──────────────────────────────────────────────────────
+function svgIcon(inner) {
+  return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${inner}</svg>`;
+}
+
+const ICONS = {
+  files:  '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
+  memory: '<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2"/>',
+  fetch:  '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18"/>',
+  search: '<circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/>',
+  mail:   '<rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-10 5L2 7"/>',
+  cal:    '<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M8 2v4M16 2v4M3 10h18"/>',
+  drive:  '<path d="M8 4h8l5 9-4 7H7l-4-7z"/><path d="M3 13h18M8 4l4 9M16 4l-4 9"/>',
+  maps:   '<path d="M9 3 3 5v16l6-2 6 2 6-2V3l-6 2-6-2z"/><path d="M9 3v16M15 5v16"/>',
+  whatsapp:'<path d="M3 21l1.6-5A8 8 0 1 1 8 19.4z"/><path d="M9 9c0 4 2 6 6 6"/>',
+  github: '<path d="M9 19c-4 1.5-4-2.5-6-3m12 5v-3.5a3 3 0 0 0-.8-2.3c2.6-.3 5.3-1.3 5.3-5.8a4.5 4.5 0 0 0-1.3-3.1 4 4 0 0 0-.1-3.1s-1.1-.3-3.5 1.3a12 12 0 0 0-6.2 0C6.5 2.8 5.4 3.1 5.4 3.1a4 4 0 0 0-.1 3.1A4.5 4.5 0 0 0 4 9.3c0 4.5 2.7 5.5 5.3 5.8a3 3 0 0 0-.8 2.3V21"/>',
+  git:    '<circle cx="12" cy="6" r="2"/><circle cx="6" cy="18" r="2"/><circle cx="18" cy="18" r="2"/><path d="M12 8v4a4 4 0 0 1-4 4M12 12a4 4 0 0 0 4 4"/>',
+  spotify:'<circle cx="12" cy="12" r="9"/><path d="M7 9.5c3.5-1 7-0.5 10 1M7.5 13c3-0.8 5.8-0.3 8 1M8 16c2.3-0.6 4.3-0.3 6 0.7"/>',
+  browser:'<circle cx="12" cy="12" r="9"/><path d="M3 9h18M9 21c-2-3-2-15 0-18M15 21c2-3 2-15 0-18"/>',
+  shell:  '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/>',
+  slack:  '<rect x="10" y="3" width="4" height="10" rx="2"/><rect x="3" y="10" width="10" height="4" rx="2"/><path d="M14 14h3a2 2 0 1 1-2 2v-2zM10 10H7a2 2 0 1 1 2-2v2z"/>',
+  notion: '<path d="M5 4h11l3 3v13H5z"/><path d="M9 9v6M9 9l6 6M15 9v6"/>',
+  neo4j:  '<circle cx="6" cy="6" r="2.4"/><circle cx="18" cy="9" r="2.4"/><circle cx="9" cy="18" r="2.4"/><path d="M8 7.4 15.6 9M7.6 8.2l1.1 7.5M10.8 16.8 16.4 11"/>',
+};
+
+// Static catalog — adding a server later = one entry here.
+const MCP_CATALOG = [
+  { id:"gmail", name:"Gmail", cat:"Your data", icon:ICONS.mail, status:"available",
+    desc:"Search, read, send and label your email — retrieve anything from your inbox.",
+    data:"Read/search emails, send mail, manage labels & attachments", auth:"OAuth (Google)",
+    steps:["Click Connect with Google","Approve Gmail access","Token saved locally in token.json"] },
+  { id:"gcal", name:"Google Calendar", cat:"Productivity", icon:ICONS.cal, status:"available",
+    desc:"Create, update and delete events, and read your agenda.",
+    data:"Read & write calendar events", auth:"OAuth (Google)",
+    steps:["Connect with Google","Approve Calendar scope","Reuses your Google sign-in"] },
+  { id:"gdrive", name:"Google Drive", cat:"Your data", icon:ICONS.drive, status:"available",
+    desc:"Search, read and create documents and files in your Drive.",
+    data:"Read/search Drive files, create docs", auth:"OAuth (Google)",
+    steps:["Connect with Google","Approve Drive scope","Reuses your Google sign-in"] },
+  { id:"whatsapp", name:"WhatsApp", cat:"Your data", icon:ICONS.whatsapp, status:"available",
+    desc:"Search and read your chats, find contacts, and send messages & media.",
+    data:"Read/search chats & contacts, send messages", auth:"QR code (link device)",
+    steps:["Start the WhatsApp bridge","Scan the QR code from WhatsApp → Linked devices","Messages cached locally in SQLite"] },
+  { id:"github", name:"GitHub", cat:"Developer", icon:ICONS.github, status:"available",
+    desc:"Work with issues, PRs, repositories, code search and actions.",
+    data:"Repos, issues, PRs, code search", auth:"Personal access token",
+    steps:["Create a scoped PAT on GitHub","Paste it here","Stored in backend/.env (gitignored)"] },
+  { id:"git", name:"Git (local)", cat:"Developer", icon:ICONS.git, status:"local",
+    desc:"Read, search and commit your local repositories.",
+    data:"Local git repos within allowed folders", auth:"Local — no login",
+    steps:["Enable the server","Operates on repos inside your allowed directories"] },
+  { id:"filesystem", name:"Filesystem", cat:"Local & system", icon:ICONS.files, status:"local",
+    desc:"Read, write, search and move files — scoped to safe directories.",
+    data:"Files in allowed roots (D:\\, E:\\, your user folder) — excludes Windows & secrets", auth:"Local — no login",
+    steps:["Enable the server","Pick allowed root folders","System dirs & secrets are blocked"] },
+  { id:"neo4j-memory", name:"Neo4j Graph Memory", cat:"Database", icon:ICONS.neo4j, status:"available",
+    desc:"Long-term memory in your Neo4j graph — recalls and updates existing nodes instead of duplicating.",
+    data:"Read/write entities, relations & observations in Neo4j", auth:"Neo4j URI + credentials",
+    steps:["Start Neo4j (Aura free tier or local Docker)","Set NEO4J_URI / USERNAME / PASSWORD in backend/.env","Writes use MERGE (upsert) on a normalized key — no duplicate nodes, updates in place"] },
+  { id:"neo4j-cypher", name:"Neo4j Cypher", cat:"Database", icon:ICONS.neo4j, status:"available",
+    desc:"Run read & write Cypher and explore your graph schema for power graph operations.",
+    data:"Any read/write Cypher against your Neo4j database", auth:"Neo4j URI + credentials",
+    steps:["Reuses your Neo4j connection","Schema discovery + parameterized read/write queries"] },
+  { id:"shell", name:"Shell / Desktop", cat:"Local & system", icon:ICONS.shell, status:"local",
+    desc:"Run commands, manage processes and control desktop apps. High power.",
+    data:"Terminal & process control", auth:"Local — no login",
+    steps:["Enable the server","Risky actions require confirmation","Use with care"] },
+  { id:"fetch", name:"Web Fetch", cat:"Web & actions", icon:ICONS.fetch, status:"local",
+    desc:"Read any web page as clean markdown for research and summaries.",
+    data:"Public web pages", auth:"Local — no login",
+    steps:["Enable the server","Pass it any URL"] },
+  { id:"websearch", name:"Web Search", cat:"Web & actions", icon:ICONS.search, status:"available",
+    desc:"Live web search to answer current questions and find sources.",
+    data:"Web search results", auth:"API key (Brave / Tavily)",
+    steps:["Get a free API key","Paste it here","Stored in backend/.env"] },
+  { id:"maps", name:"Maps / Places", cat:"Web & actions", icon:ICONS.maps, status:"available",
+    desc:"Geocoding, places, directions and distances for location-aware tasks.",
+    data:"Places, geocoding, directions", auth:"API key (Google Maps)",
+    steps:["Enable Maps APIs in Google Cloud","Paste the key here","Stored in backend/.env"] },
+  { id:"browser", name:"Browser", cat:"Web & actions", icon:ICONS.browser, status:"local",
+    desc:"Drive a real browser — navigate, click, fill forms, scrape and screenshot.",
+    data:"Live web pages (acts on your behalf)", auth:"Local — no login",
+    steps:["Enable the server (Playwright)","Risky actions require confirmation"] },
+  { id:"spotify", name:"Spotify", cat:"Entertainment", icon:ICONS.spotify, status:"available",
+    desc:"Control playback, manage playlists, search and get recommendations.",
+    data:"Playback, playlists, library", auth:"OAuth (Spotify)",
+    steps:["Create a Spotify app","Connect with Spotify","Approve playback scope"] },
+  { id:"slack", name:"Slack", cat:"Productivity", icon:ICONS.slack, status:"available",
+    desc:"Read channels, summarize threads and post messages.",
+    data:"Channels, messages", auth:"OAuth (Slack)",
+    steps:["Install the Slack app","Connect with Slack","Approve workspace access"] },
+  { id:"notion", name:"Notion", cat:"Productivity", icon:ICONS.notion, status:"available",
+    desc:"Semantic search and edits across your Notion workspace.",
+    data:"Notion pages & databases", auth:"OAuth (Notion)",
+    steps:["Connect with Notion","Share the pages you want accessible"] },
+];
+
+const MCP_CAT_ORDER = ["Your data","Database","Productivity","Developer","Web & actions","Entertainment","Local & system"];
+let _gmailEmail = null;
+
+function statusChip(item) {
+  if (item.status === "connected") return `<span class="mcp-status connected">Connected</span>`;
+  if (item.status === "local")     return `<span class="mcp-status local">No login</span>`;
+  return `<span class="mcp-status available">Available</span>`;
+}
+
+function renderMcpList() {
+  const page = document.getElementById("mcp-list-page");
+  if (!page) return;
+  const connected = MCP_CATALOG.filter(i => i.status === "connected").length;
+
+  let html = `
+    <div class="mcp-page-head">
+      <div class="mcp-eyebrow">${svgIcon('<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" fill="currentColor" stroke="none"></polygon>')} Integrations</div>
+      <h2>Connect OrbixAI to your world</h2>
+      <p>Give your assistant the tools to act — mail, chats, files, code, the web and more. Pick one to see what it does and how to connect.</p>
+      <div class="mcp-summary"><b>${connected}</b> connected · <b>${MCP_CATALOG.length}</b> available</div>
+    </div>`;
+
+  MCP_CAT_ORDER.forEach(cat => {
+    const items = MCP_CATALOG.filter(i => i.cat === cat);
+    if (!items.length) return;
+    html += `<div class="mcp-section-title">${escapeHtml(cat)}</div>`;
+    items.forEach(item => {
+      html += `
+        <button class="mcp-row" data-id="${item.id}">
+          <span class="mcp-icon">${item.icon ? svgIcon(item.icon) : ""}</span>
+          <span class="mcp-row-body">
+            <span class="mcp-row-name">${escapeHtml(item.name)}</span>
+            <span class="mcp-row-desc">${escapeHtml(item.desc)}</span>
+          </span>
+          ${statusChip(item)}
+          <span class="mcp-chevron">${svgIcon('<path d="M9 6l6 6-6 6"/>')}</span>
+        </button>`;
+    });
+  });
+
+  page.innerHTML = html;
+  page.querySelectorAll(".mcp-row").forEach(row => {
+    row.addEventListener("click", () => openMcpDetail(row.dataset.id));
+  });
+}
+
+function openMcpDetail(id) {
+  const item = MCP_CATALOG.find(i => i.id === id);
+  const listEl   = document.getElementById("mcp-list-page");
+  const detailEl = document.getElementById("mcp-detail-page");
+  if (!item || !detailEl) return;
+
+  const isConnected = item.status === "connected";
+  const connectLabel = isConnected
+    ? (item.id === "gmail" && _gmailEmail ? `Connected · ${escapeHtml(_gmailEmail)}` : "Connected")
+    : (item.auth.startsWith("OAuth") ? `Connect with ${item.auth.replace(/^OAuth \(|\)$/g,"")}`
+       : item.auth.startsWith("Local") ? "Enable" : "Connect");
+
+  const steps = (item.steps || []).map((s, i) =>
+    `<li class="mcp-step"><span class="mcp-step-num">${i+1}</span><span>${escapeHtml(s)}</span></li>`).join("");
+
+  detailEl.innerHTML = `
+    <button class="mcp-back" id="mcp-back">${svgIcon('<path d="M15 18l-6-6 6-6"/>')} All integrations</button>
+    <div class="mcp-detail-head">
+      <span class="mcp-detail-icon">${item.icon ? svgIcon(item.icon) : ""}</span>
+      <div class="mcp-detail-title">
+        <h2>${escapeHtml(item.name)}</h2>
+        ${statusChip(item)}
+      </div>
+    </div>
+    <p class="mcp-detail-desc">${escapeHtml(item.desc)}</p>
+    <div class="mcp-meta">
+      <div class="mcp-meta-card"><div class="mcp-meta-label">Data it accesses</div><div class="mcp-meta-value">${escapeHtml(item.data)}</div></div>
+      <div class="mcp-meta-card"><div class="mcp-meta-label">Authentication</div><div class="mcp-meta-value">${escapeHtml(item.auth)}</div></div>
+    </div>
+    <div class="mcp-steps-title">How to connect</div>
+    <ul class="mcp-steps">${steps}</ul>
+    <div class="mcp-connect-row">
+      <button class="mcp-connect-btn ${isConnected ? "is-connected" : ""}" id="mcp-connect" ${isConnected ? "disabled" : ""}>
+        ${isConnected ? svgIcon('<path d="M20 6 9 17l-5-5"/>') : ""}${connectLabel}
+      </button>
+    </div>
+    <div class="mcp-inline-msg" id="mcp-inline-msg"></div>
+    <div class="mcp-note">This is the connection interface. Live wiring for each server ships per the phased rollout in <b>MCP&nbsp;plan.md</b>. Local servers need no login; OAuth/token/QR servers store credentials locally in <code style="font-family:'JetBrains Mono',monospace">backend/.env</code>.</div>`;
+
+  listEl.hidden  = true;
+  detailEl.hidden = false;
+
+  document.getElementById("mcp-back").addEventListener("click", closeMcpDetail);
+  const connectBtn = document.getElementById("mcp-connect");
+  if (connectBtn && !isConnected) {
+    connectBtn.addEventListener("click", () => {
+      const msg = document.getElementById("mcp-inline-msg");
+      if (item.id === "gmail" || item.id === "gcal" || item.id === "gdrive") {
+        if (msg) msg.textContent = "Opening Google sign-in…";
+        window.location.href = `${API_BASE}/auth/login`;
+        return;
+      }
+      if (msg) msg.textContent = `Saved your intent to connect ${item.name}. It activates once this server is wired (see MCP plan.md).`;
+    });
+  }
+}
+
+function closeMcpDetail() {
+  const listEl   = document.getElementById("mcp-list-page");
+  const detailEl = document.getElementById("mcp-detail-page");
+  if (detailEl) { detailEl.hidden = true; detailEl.innerHTML = ""; }
+  if (listEl)   listEl.hidden = false;
+}
+
+function switchView(view) {
+  document.querySelectorAll(".nav-seg-btn").forEach(b => {
+    const on = b.dataset.view === view;
+    b.classList.toggle("active", on);
+    b.setAttribute("aria-selected", on ? "true" : "false");
+  });
+  document.querySelectorAll(".view").forEach(v => v.classList.remove("active"));
+  const target = document.getElementById(view === "mcp" ? "view-mcp" : "view-chat");
+  if (target) target.classList.add("active");
+  if (view === "mcp") { closeMcpDetail(); }
+  else if (userInput) userInput.focus();
+}
+
+function initMcp() {
+  renderMcpList();
+  document.querySelectorAll(".nav-seg-btn").forEach(b => {
+    b.addEventListener("click", () => switchView(b.dataset.view));
+  });
+  // Reflect real Gmail connection state
+  fetch(`${API_BASE}/auth/profile`).then(r => r.json()).then(data => {
+    if (data && data.authenticated) {
+      _gmailEmail = data.email || null;
+      const gmail = MCP_CATALOG.find(i => i.id === "gmail");
+      if (gmail) gmail.status = "connected";
+      renderMcpList();
+    }
+  }).catch(() => {});
+}
+
 // ── App Init ──────────────────────────────────────────────────────────────────
 window.addEventListener("load", () => {
   initializeTheme();
@@ -1166,6 +1403,7 @@ window.addEventListener("load", () => {
   loadUserName();
   if (userInput) userInput.focus();
   showWelcomeHero();
+  initMcp();
   startEmailAutoRefresh();
   startHealthCheck();
   initCalendar();
