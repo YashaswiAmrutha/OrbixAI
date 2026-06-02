@@ -1,21 +1,19 @@
-import ollama
 import logging
+from llm.hf_client import chat_response, ORCHESTRATOR_MODEL, FALLBACK_MODEL
 
 logger = logging.getLogger(__name__)
 
+
 def generate_response(prompt: str) -> str:
-    """Generate a response from Ollama using llama3.1:8b model."""
+    """Generate a conversational reply via the local Ollama fine-tuned model."""
+    return chat_response(prompt)
+
+
+def is_available() -> bool:
+    """Check if Ollama is reachable."""
     try:
-        logger.debug(f"Sending prompt to llama3.1:8b model")
-        response = ollama.chat(
-            model="llama3.1:8b",
-            messages=[
-                {"role": "user", "content": prompt}
-            ]
-        )
-        result = response["message"]["content"].strip()
-        logger.debug(f"Received response: {result[:100]}...")
-        return result
-    except Exception as e:
-        logger.error(f"Error generating response: {str(e)}")
-        raise
+        import ollama
+        ollama.list()
+        return True
+    except Exception:
+        return False

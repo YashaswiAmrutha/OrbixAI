@@ -10,11 +10,13 @@ from google_service.gmail_client import GmailClient
 from google_service.mail_generator import MailGenerator
 from google_service.travel_planner import plan_trip
 from intent_workflow import IntentClassifier, WorkflowExecutor, WorkflowTask
+from calendar_store import get_events, create_event, bulk_create_events, update_event, delete_event
 from faster_whisper import WhisperModel
 import asyncio
 import tempfile
 import json
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 import logging
 import os
 
@@ -293,6 +295,47 @@ def register_workflows():
 # Initialize workflows on startup
 register_workflows()
 
+
+# ============ CALENDAR HELPERS ============
+def extract_travel_calendar_events(itinerary: str, destination: str,
+                                   departure_date: str = None) -> list:
+    """Parse day-wise itinerary text into calendar event dicts."""
+    events = []
+    base_date = None
+    if departure_date:
+        try:
+            base_date = datetime.strptime(departure_date, "%Y-%m-%d")
+        except Exception:
+            pass
+    if not base_date:
+        base_date = datetime.utcnow()
+
+    pattern = re.compile(r'day\s+(\d+)[:\s\-–]+([^\n]+)', re.IGNORECASE)
+    matches = pattern.findall(itinerary or "")
+
+    if matches:
+        for day_str, title in matches:
+            day_num = int(day_str)
+            event_date = base_date + timedelta(days=day_num - 1)
+            events.append({
+                "title": f"Day {day_num}: {title.strip()[:70]}",
+                "date": event_date.strftime("%Y-%m-%d"),
+                "time": "",
+                "description": f"Trip to {destination}",
+                "type": "travel",
+                "source": "ai_travel",
+            })
+    else:
+        events.append({
+            "title": f"Trip to {destination}",
+            "date": base_date.strftime("%Y-%m-%d"),
+            "time": "",
+            "description": (itinerary or "")[:400],
+            "type": "travel",
+            "source": "ai_travel",
+        })
+    return events
+
 @app.get("/")
 def serve_index():
     return FileResponse(FRONTEND_DIR / "index.html")
@@ -304,6 +347,19 @@ def auth_status():
     if client and client.is_authenticated():
         return {"authenticated": True}
     return {"authenticated": False, "auth_url": "/auth/login"}
+
+@app.get("/auth/profile")
+def auth_profile():
+    """Return the logged-in user's display name and email for personalization."""
+    client = get_gmail_client()
+    if not client or not client.is_authenticated():
+        return {"authenticated": False, "name": None, "email": None}
+    try:
+        prof = client.get_user_profile()
+        return {"authenticated": True, "name": prof.get("name"), "email": prof.get("email")}
+    except Exception as e:
+        logger.error(f"auth_profile error: {e}")
+        return {"authenticated": True, "name": None, "email": None}
 
 @app.get("/auth/login")
 def auth_login():
@@ -332,6 +388,37 @@ def auth_callback(request: Request):
 @app.get("/health")
 def health_check():
     return {"message": "Orbii Backend API is running", "status": "ok"}
+
+
+# ============ CALENDAR ENDPOINTS ============
+@app.get("/calendar/events")
+def list_calendar_events(year: int = None, month: int = None):
+    return {"events": get_events(year, month)}
+
+
+@app.post("/calendar/events")
+def add_calendar_event(payload: dict):
+    ev = create_event(**payload)
+    return {"success": True, "event": ev}
+
+
+@app.post("/calendar/events/bulk")
+def add_calendar_events_bulk(payload: dict):
+    events = bulk_create_events(payload.get("events", []))
+    return {"success": True, "events": events, "count": len(events)}
+
+
+@app.put("/calendar/events/{event_id}")
+def modify_calendar_event(event_id: str, payload: dict):
+    ev = update_event(event_id, **payload)
+    if ev:
+        return {"success": True, "event": ev}
+    return {"success": False, "error": "Event not found"}
+
+
+@app.delete("/calendar/events/{event_id}")
+def remove_calendar_event(event_id: str):
+    return {"success": delete_event(event_id)}
 
 @app.post("/chat")
 def chat(message: dict):
@@ -568,9 +655,22 @@ async def chat_stream(message: dict):
                     parts.append(f"**📍 Top Attractions:** {top}")
                 parts.append("\n### Itinerary\n" + itinerary)
 
-                yield _sse({"type": "response",
-                            "reply": "\n\n".join(parts),
-                            "intent": intent})
+                # Auto-create calendar events from travel itinerary
+                cal_ev_defs = extract_travel_calendar_events(
+                    itinerary,
+                    dest,
+                    travel_result["entities"].get("departure_date"),
+                )
+                saved_cal_events = bulk_create_events(cal_ev_defs)
+                todo_items = [{"text": f"Plan trip to {dest}", "source": "ai_travel"}]
+
+                yield _sse({
+                    "type": "response",
+                    "reply": "\n\n".join(parts),
+                    "intent": intent,
+                    "calendar_events": saved_cal_events,
+                    "todo_items": todo_items,
+                })
                 return
 
             # ── get_emails ──────────────────────────────────────────────────
@@ -668,9 +768,26 @@ async def chat_stream(message: dict):
                         parts.append(f"Email to {recipient} failed: "
                                      + email_result.get("error", "unknown error"))
 
-                yield _sse({"type": "response",
-                            "reply": "\n\n".join(parts) if parts else "Done.",
-                            "intent": intent})
+                # Auto-create calendar event for the meeting
+                meeting_date = (parameters.get("start_time") or "")[:10] or datetime.utcnow().strftime("%Y-%m-%d")
+                meeting_time = (parameters.get("start_time") or "")[11:16]
+                saved_meet_event = create_event(
+                    title=parameters.get("event_title", "Meeting"),
+                    date=meeting_date,
+                    time=meeting_time,
+                    description=f"Attendee: {recipient}\nMeet link: {meet_link or 'N/A'}",
+                    type="meeting",
+                    source="ai_meeting",
+                )
+                meet_todos = [{"text": f"Prepare for: {parameters.get('event_title', 'Meeting')}", "source": "ai_meeting"}]
+
+                yield _sse({
+                    "type": "response",
+                    "reply": "\n\n".join(parts) if parts else "Done.",
+                    "intent": intent,
+                    "calendar_events": [saved_meet_event],
+                    "todo_items": meet_todos,
+                })
                 return
 
             # ── fallback ────────────────────────────────────────────────────
@@ -884,11 +1001,15 @@ async def get_latest_emails(max_results: int = 10):
         loop = asyncio.get_event_loop()
         emails = await asyncio.wait_for(
             loop.run_in_executor(None, client.get_all_recent_emails, max_results),
-            timeout=20.0
+            timeout=30.0
         )
         return {"success": True, "emails": emails}
     except asyncio.TimeoutError:
-        logger.error("Email fetch timed out after 20s")
+        logger.error("Email fetch timed out after 30s")
+        # Return stale cache rather than an error so the UI stays populated
+        if client and hasattr(client, "_email_cache") and client._email_cache:
+            logger.info("Serving stale email cache after timeout")
+            return {"success": True, "emails": client._email_cache, "stale": True}
         return {"error": "Gmail request timed out", "emails": []}
     except Exception as e:
         err = str(e)

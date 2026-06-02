@@ -1,6 +1,8 @@
 import os
 import json
 import base64
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from google.auth.transport.requests import Request
 from google.oauth2.service_account import Credentials
@@ -16,6 +18,8 @@ logger = logging.getLogger(__name__)
 SCOPES = ['https://www.googleapis.com/auth/gmail.modify', 'https://www.googleapis.com/auth/calendar']
 
 
+_EMAIL_CACHE_TTL = 25  # seconds — slightly less than the 30s auto-refresh interval
+
 class GmailClient:
     def __init__(self, credentials_file='credentials.json', token_file='token.json', redirect_uri='http://127.0.0.1:8001/auth/callback'):
         self.service = None
@@ -24,6 +28,11 @@ class GmailClient:
         self.credentials_file = credentials_file
         self.token_file = token_file
         self.redirect_uri = redirect_uri
+        self._flow = None
+        # In-memory email cache (avoids repeated full fetches on every 30s auto-refresh)
+        self._email_cache = None
+        self._email_cache_time = None
+        self._email_cache_lock = threading.Lock()
         self._try_load_token()
 
     def _try_load_token(self):
@@ -56,8 +65,8 @@ class GmailClient:
             return False
 
     def _build_services(self):
-        """Build Gmail and Calendar API services from current credentials."""
-        self.service = build('gmail', 'v1', credentials=self.credentials)
+        """Build Gmail and Calendar API services using google-auth credentials directly."""
+        self.service          = build('gmail',    'v1', credentials=self.credentials)
         self.calendar_service = build('calendar', 'v3', credentials=self.credentials)
         logger.info("Gmail and Calendar services initialized successfully")
 
@@ -79,12 +88,12 @@ class GmailClient:
                 f"and save it to: {os.path.abspath(self.credentials_file)}"
             )
 
-        flow = Flow.from_client_secrets_file(
+        self._flow = Flow.from_client_secrets_file(
             self.credentials_file,
             scopes=SCOPES,
             redirect_uri=self.redirect_uri
         )
-        auth_url, state = flow.authorization_url(
+        auth_url, state = self._flow.authorization_url(
             access_type='offline',
             prompt='consent'
         )
@@ -93,13 +102,16 @@ class GmailClient:
 
     def handle_auth_callback(self, authorization_response_url):
         """Handle the OAuth callback and save credentials."""
-        flow = Flow.from_client_secrets_file(
-            self.credentials_file,
-            scopes=SCOPES,
-            redirect_uri=self.redirect_uri
-        )
-        flow.fetch_token(authorization_response=authorization_response_url)
-        self.credentials = flow.credentials
+        if self._flow is None:
+            # Fallback: recreate flow without PKCE (state won't be verified)
+            self._flow = Flow.from_client_secrets_file(
+                self.credentials_file,
+                scopes=SCOPES,
+                redirect_uri=self.redirect_uri
+            )
+        self._flow.fetch_token(authorization_response=authorization_response_url)
+        self.credentials = self._flow.credentials
+        self._flow = None
         self._save_token()
         self._build_services()
         logger.info("OAuth2 authentication successful via callback")
@@ -157,98 +169,122 @@ class GmailClient:
                 raise Exception("needs_auth")
 
     def get_all_recent_emails(self, max_results=10):
-        """Fetch both received and sent emails using lightweight metadata format"""
+        """
+        Fetch inbox + sent emails using direct REST calls (requests library) for
+        parallel fetches — avoids httplib2 SSL corruption under concurrent threads.
+        """
+        import requests as _req
+        from email.utils import parsedate_to_datetime
+
+        # ── 1. Return cached result if still fresh ───────────────────────────
+        with self._email_cache_lock:
+            if (self._email_cache is not None and
+                    self._email_cache_time is not None and
+                    (datetime.utcnow() - self._email_cache_time).total_seconds() < _EMAIL_CACHE_TTL):
+                logger.info("Returning cached emails (cache hit)")
+                return self._email_cache
+
         try:
             self._ensure_fresh_credentials()
-            all_emails = []
 
-            # Fetch inbox and sent message IDs
-            inbox_results = self.service.users().messages().list(
-                userId='me',
-                q='in:inbox',
-                maxResults=max_results
-            ).execute()
+            token    = self.credentials.token
+            base_url = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
+            auth_hdr = {"Authorization": f"Bearer {token}"}
+            per_folder = max(5, max_results // 2)
 
-            sent_results = self.service.users().messages().list(
-                userId='me',
-                q='in:sent',
-                maxResults=max_results
-            ).execute()
+            # ── 2. Fetch inbox + sent IDs in parallel (requests, thread-safe) ─
+            def list_folder(q):
+                resp = _req.get(base_url, headers=auth_hdr,
+                                params={"q": q, "maxResults": per_folder,
+                                        "fields": "messages/id"},
+                                timeout=10)
+                resp.raise_for_status()
+                return resp.json().get("messages", [])
 
-            inbox_ids = inbox_results.get('messages', [])
-            sent_ids = sent_results.get('messages', [])
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                inbox_f = pool.submit(list_folder, "in:inbox")
+                sent_f  = pool.submit(list_folder, "in:sent")
+                inbox_ids = inbox_f.result()
+                sent_ids  = sent_f.result()
 
-            # De-duplicate (same message can appear in both)
-            seen = set()
+            # Build deduplicated task list
+            seen, tasks = set(), []
+            for m in inbox_ids:
+                if m["id"] not in seen:
+                    seen.add(m["id"])
+                    tasks.append((m["id"], "received"))
+            for m in sent_ids:
+                if m["id"] not in seen:
+                    seen.add(m["id"])
+                    tasks.append((m["id"], "sent"))
 
-            for message in inbox_ids:
-                mid = message['id']
-                if mid in seen:
-                    continue
-                seen.add(mid)
+            # ── 3. Fetch each message's metadata in parallel ─────────────────
+            # Each worker uses its own requests.Session — fully thread-safe.
+            META_PARAMS = [
+                ("format", "metadata"),
+                ("metadataHeaders", "From"),
+                ("metadataHeaders", "To"),
+                ("metadataHeaders", "Subject"),
+                ("metadataHeaders", "Date"),
+                ("fields", "id,snippet,payload/headers"),
+            ]
+
+            def fetch_message(id_type):
+                mid, mtype = id_type
                 try:
-                    msg = self.service.users().messages().get(
-                        userId='me',
-                        id=mid,
-                        format='metadata',
-                        metadataHeaders=['From', 'To', 'Subject', 'Date']
-                    ).execute()
-
-                    headers = {h['name']: h['value'] for h in msg.get('payload', {}).get('headers', [])}
-                    all_emails.append({
-                        'id': mid,
-                        'from': headers.get('From', 'Unknown'),
-                        'to': headers.get('To', ''),
-                        'subject': headers.get('Subject', 'No Subject'),
-                        'date': headers.get('Date', ''),
-                        'snippet': msg.get('snippet', ''),
-                        'type': 'received'
-                    })
+                    with _req.Session() as s:
+                        r = s.get(f"{base_url}/{mid}", headers=auth_hdr,
+                                  params=META_PARAMS, timeout=8)
+                        r.raise_for_status()
+                    msg  = r.json()
+                    hdrs = {h["name"]: h["value"]
+                            for h in msg.get("payload", {}).get("headers", [])}
+                    return {
+                        "id":      mid,
+                        "from":    hdrs.get("From", "Unknown"),
+                        "to":      hdrs.get("To", ""),
+                        "subject": hdrs.get("Subject", "No Subject"),
+                        "date":    hdrs.get("Date", ""),
+                        "snippet": msg.get("snippet", ""),
+                        "type":    mtype,
+                    }
                 except Exception as e:
-                    logger.error(f"Error processing inbox message {mid}: {str(e)}")
-                    continue
-
-            for message in sent_ids:
-                mid = message['id']
-                if mid in seen:
-                    continue
-                seen.add(mid)
-                try:
-                    msg = self.service.users().messages().get(
-                        userId='me',
-                        id=mid,
-                        format='metadata',
-                        metadataHeaders=['From', 'To', 'Subject', 'Date']
-                    ).execute()
-
-                    headers = {h['name']: h['value'] for h in msg.get('payload', {}).get('headers', [])}
-                    all_emails.append({
-                        'id': mid,
-                        'from': headers.get('From', 'Unknown'),
-                        'to': headers.get('To', ''),
-                        'subject': headers.get('Subject', 'No Subject'),
-                        'date': headers.get('Date', ''),
-                        'snippet': msg.get('snippet', ''),
-                        'type': 'sent'
-                    })
-                except Exception as e:
-                    logger.error(f"Error processing sent message {mid}: {str(e)}")
-                    continue
-
-            # Sort by date, newest first
-            def parse_email_date(date_str):
-                from email.utils import parsedate_to_datetime
-                try:
-                    return parsedate_to_datetime(date_str)
-                except:
+                    logger.warning(f"Skipping message {mid}: {e}")
                     return None
 
-            all_emails.sort(key=lambda x: parse_email_date(x['date']) or datetime.min, reverse=True)
+            workers = min(8, max(1, len(tasks)))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                results = list(pool.map(fetch_message, tasks))
 
-            return all_emails[:max_results * 2]
+            all_emails = [r for r in results if r is not None]
+
+            # ── 4. Sort newest-first ─────────────────────────────────────────
+            def _parse_date(date_str):
+                try:
+                    return parsedate_to_datetime(date_str)
+                except Exception:
+                    return None
+
+            all_emails.sort(
+                key=lambda x: _parse_date(x["date"]) or datetime.min,
+                reverse=True
+            )
+            final = all_emails[:max_results * 2]
+
+            # ── 5. Update cache ──────────────────────────────────────────────
+            with self._email_cache_lock:
+                self._email_cache      = final
+                self._email_cache_time = datetime.utcnow()
+            logger.info(f"Email fetch complete: {len(final)} emails cached")
+            return final
+
         except Exception as error:
             logger.error(f"Error fetching emails: {error}")
-            return []
+            with self._email_cache_lock:
+                if self._email_cache is not None:
+                    logger.info("Returning stale cache due to fetch error")
+                    return self._email_cache
+            raise
 
     def send_email(self, to_email, subject, body, html_body=None):
         """Send an email message"""
@@ -340,6 +376,62 @@ class GmailClient:
         except HttpError as error:
             logger.error(f"An error occurred: {error}")
             return {'success': False, 'error': str(error)}
+
+    def get_user_profile(self):
+        """
+        Return {"email", "name"} for the authenticated (logged-in) user.
+
+        Email comes from Gmail's getProfile. The display name is read from the
+        'From' header of one of the user's own sent messages (works with the
+        existing gmail.modify scope — no extra consent needed). Falls back to a
+        name derived from the email local-part.
+        """
+        import re as _re
+        from email.utils import parseaddr
+
+        profile = {"email": None, "name": None}
+        try:
+            self._ensure_fresh_credentials()
+
+            # ── Email address ────────────────────────────────────────────────
+            try:
+                p = self.service.users().getProfile(userId='me').execute()
+                profile["email"] = p.get("emailAddress")
+            except Exception as e:
+                logger.warning(f"getProfile failed: {e}")
+
+            # ── Real display name from a sent message's From header ───────────
+            try:
+                lst = self.service.users().messages().list(
+                    userId='me', q='in:sent', maxResults=1
+                ).execute()
+                msgs = lst.get('messages', [])
+                if msgs:
+                    m = self.service.users().messages().get(
+                        userId='me', id=msgs[0]['id'],
+                        format='metadata', metadataHeaders=['From']
+                    ).execute()
+                    hdrs = {h['name']: h['value']
+                            for h in m.get('payload', {}).get('headers', [])}
+                    realname, _addr = parseaddr(hdrs.get('From', ''))
+                    if realname:
+                        profile["name"] = realname.strip()
+            except Exception as e:
+                logger.warning(f"Sent-name lookup failed: {e}")
+
+            # ── Fallback: derive a friendly name from the email local-part ────
+            if not profile["name"] and profile["email"]:
+                local = profile["email"].split("@")[0]
+                token = _re.split(r'[._\-+]', local)[0]
+                token = _re.sub(r'\d+', '', token)
+                if token:
+                    profile["name"] = token[:1].upper() + token[1:]
+
+            logger.info(f"User profile resolved: name={profile['name']}, email={profile['email']}")
+            return profile
+        except Exception as e:
+            logger.error(f"get_user_profile error: {e}")
+            return profile
 
     def get_email_for_contact(self, contact_name):
         """Extract email from contact name (helper function)"""

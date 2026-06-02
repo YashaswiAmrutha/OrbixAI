@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,300..700;1,14..32,300..700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css?v=8" />
+  <link rel="stylesheet" href="/static/style.css?v=12" />
 </head>
 <body>
   <div class="app-shell">
@@ -16,6 +16,10 @@
     <aside class="left-panel">
       <div class="panel-logo">
         <div class="logo-mark">O</div>
+        <div class="logo-text">
+          <span class="logo-name">OrbixAI</span>
+          <span class="logo-tag">Personal Assistant</span>
+        </div>
       </div>
 
       <!-- Calendar Widget -->
@@ -23,15 +27,15 @@
         <div class="widget-header">
           <span class="widget-title">Calendar</span>
           <div class="cal-nav">
-            <button class="cal-nav-btn" id="cal-prev">&#8249;</button>
-            <button class="cal-nav-btn" id="cal-next">&#8250;</button>
+            <button class="cal-nav-btn" id="cal-prev" aria-label="Previous month">&#8249;</button>
+            <button class="cal-nav-btn" id="cal-next" aria-label="Next month">&#8250;</button>
           </div>
         </div>
         <div class="cal-month-label" id="cal-month-label"></div>
         <div class="cal-grid" id="cal-grid"></div>
       </div>
 
-      <!-- Upcoming / Info Widget -->
+      <!-- Today Info Widget -->
       <div class="widget widget-info">
         <div class="widget-header">
           <span class="widget-title">Today</span>
@@ -40,18 +44,49 @@
           <div class="today-date" id="today-date"></div>
           <div class="today-day" id="today-day"></div>
         </div>
+        <div class="today-agenda" id="today-agenda"></div>
       </div>
+
+      <!-- Day Events Panel (shown when a calendar day is selected) -->
+      <div class="widget day-events-panel" id="day-events-panel" style="display:none" role="region" aria-label="Day events">
+        <div class="widget-header">
+          <div class="day-events-header-left">
+            <span class="widget-title" id="day-events-title">Events</span>
+            <span class="day-events-count" id="day-events-count">0</span>
+          </div>
+          <button class="icon-action-btn" id="day-events-close" title="Close panel" aria-label="Close events panel">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="18" y1="6" x2="6" y2="18"></line>
+              <line x1="6" y1="6" x2="18" y2="18"></line>
+            </svg>
+          </button>
+        </div>
+        <div class="day-events-list" id="day-events-list" role="list"></div>
+        <div class="day-event-add">
+          <div class="day-event-add-row">
+            <input type="text" id="day-event-input" placeholder="Add event…" maxlength="70" aria-label="New event title" />
+            <select id="day-event-type" class="day-event-type-select" aria-label="Event type">
+              <option value="general">General</option>
+              <option value="meeting">Meeting</option>
+              <option value="travel">Travel</option>
+              <option value="task">Task</option>
+            </select>
+            <button id="day-event-add-btn" class="todo-add-btn" title="Add event" aria-label="Add event">+</button>
+          </div>
+        </div>
+      </div>
+
     </aside>
 
     <!-- ===== CENTER: CHAT ===== -->
     <main class="chat-main">
       <header class="chat-header">
         <div class="chat-header-title">
-          <h1>OrbixAI</h1>
-          <p>Your intelligent assistant</p>
+          <h1 id="greeting-line">Welcome back</h1>
+          <p id="greeting-sub">Your intelligent assistant</p>
         </div>
         <div class="chat-header-controls">
-          <button class="ctrl-btn btn-voice" id="mic-btn" title="Voice input">
+          <button class="ctrl-btn btn-voice" id="mic-btn" title="Voice input" aria-label="Voice input">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <rect x="9" y="2" width="6" height="11" rx="3"></rect>
               <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
@@ -59,7 +94,7 @@
               <line x1="8" y1="22" x2="16" y2="22"></line>
             </svg>
           </button>
-          <button class="ctrl-btn" id="voice-mute-btn" title="Toggle voice reply">
+          <button class="ctrl-btn" id="voice-mute-btn" title="Toggle voice reply" aria-label="Toggle voice reply">
             <svg class="icon-sound-on" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
               <path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path>
@@ -71,7 +106,7 @@
               <line x1="17" y1="9" x2="23" y2="15"></line>
             </svg>
           </button>
-          <button class="ctrl-btn" id="theme-toggle" title="Toggle theme">
+          <button class="ctrl-btn" id="theme-toggle" title="Toggle theme" aria-label="Toggle theme">
             <svg class="icon-sun" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <circle cx="12" cy="12" r="5"></circle>
               <line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line>
@@ -90,8 +125,8 @@
 
       <div class="input-area">
         <div class="input-wrapper">
-          <input type="text" id="user-input" placeholder="Ask OrbixAI anything…" autocomplete="off" />
-          <button class="send-btn" id="send-btn" title="Send">
+          <input type="text" id="user-input" placeholder="Ask OrbixAI anything…" autocomplete="off" aria-label="Chat input" />
+          <button class="send-btn" id="send-btn" title="Send" aria-label="Send message">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
               <line x1="22" y1="2" x2="11" y2="13"></line>
               <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
@@ -109,16 +144,16 @@
         <div class="widget-header">
           <div class="widget-header-left">
             <span class="widget-title">Emails</span>
-            <span class="mail-dot" id="mail-auto-update">&#9679;</span>
+            <span class="mail-dot" id="mail-auto-update" aria-hidden="true">&#9679;</span>
           </div>
           <div class="widget-header-right">
-            <button class="icon-action-btn" id="mail-refresh-btn" title="Refresh">
+            <button class="icon-action-btn" id="mail-refresh-btn" title="Refresh emails" aria-label="Refresh emails">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M21.5 2v6h-6"></path><path d="M2.5 22v-6h6"></path>
                 <path d="M2 11.5a10 10 0 0 1 18.8-4.3"></path><path d="M22 12.5a10 10 0 0 1-18.8 4.3"></path>
               </svg>
             </button>
-            <button class="icon-action-btn" id="mail-toggle-btn" title="Collapse">
+            <button class="icon-action-btn" id="mail-toggle-btn" title="Collapse emails" aria-label="Collapse emails">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M15 18l-6-6 6-6"></path>
               </svg>
@@ -134,24 +169,24 @@
       <div class="right-widget todo-section">
         <div class="widget-header">
           <span class="widget-title">To-Do</span>
-          <span class="todo-count" id="todo-count">0</span>
+          <span class="todo-count" id="todo-count" aria-label="Pending tasks">0</span>
         </div>
         <div class="todo-input-row">
-          <input type="text" id="todo-input" placeholder="Add a task…" maxlength="80" />
-          <button class="todo-add-btn" id="todo-add-btn">+</button>
+          <input type="text" id="todo-input" placeholder="Add a task…" maxlength="80" aria-label="New task" />
+          <button class="todo-add-btn" id="todo-add-btn" aria-label="Add task">+</button>
         </div>
-        <div class="todo-list" id="todo-list"></div>
+        <div class="todo-list" id="todo-list" role="list"></div>
       </div>
 
     </aside>
   </div>
 
   <!-- Email Compose Modal -->
-  <div class="modal" id="mail-modal">
+  <div class="modal" id="mail-modal" role="dialog" aria-labelledby="mail-modal-title" aria-modal="true">
     <div class="modal-content">
       <div class="modal-header">
-        <h2>Send Email &amp; Create Meeting</h2>
-        <button class="modal-close" id="modal-close">
+        <h2 id="mail-modal-title">Send Email &amp; Create Meeting</h2>
+        <button class="modal-close" id="modal-close" aria-label="Close modal">
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line>
           </svg>
@@ -161,7 +196,7 @@
         <form id="mail-form">
           <div class="form-group">
             <label for="recipient-email">Recipient Email</label>
-            <input type="email" id="recipient-email" placeholder="name@example.com" required />
+            <input type="email" id="recipient-email" placeholder="name@example.com" required autocomplete="email" />
           </div>
           <div class="form-group">
             <label for="mail-prompt">Email Purpose / Prompt</label>
@@ -185,6 +220,58 @@
   </div>
   <div class="modal-overlay" id="modal-overlay"></div>
 
-  <script src="/static/script.js?v=7"></script>
+  <!-- Event Edit Modal -->
+  <div class="modal" id="event-modal" role="dialog" aria-labelledby="event-modal-title" aria-modal="true">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2 id="event-modal-title">Edit Event</h2>
+        <button class="modal-close" id="event-modal-close" aria-label="Close event modal">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <form id="event-form">
+          <input type="hidden" id="event-modal-id" />
+          <input type="hidden" id="event-modal-orig-date" />
+          <div class="form-group">
+            <label for="event-modal-title-input">Title</label>
+            <input type="text" id="event-modal-title-input" placeholder="Event title" required maxlength="100" />
+          </div>
+          <div class="form-group-row">
+            <div class="form-group form-group-half">
+              <label for="event-modal-date">Date</label>
+              <input type="date" id="event-modal-date" required />
+            </div>
+            <div class="form-group form-group-half">
+              <label for="event-modal-time">Time</label>
+              <input type="time" id="event-modal-time" />
+            </div>
+          </div>
+          <div class="form-group">
+            <label for="event-modal-type">Type</label>
+            <select id="event-modal-type" class="form-select">
+              <option value="general">General</option>
+              <option value="meeting">Meeting</option>
+              <option value="travel">Travel</option>
+              <option value="task">Task</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="event-modal-desc">Description</label>
+            <textarea id="event-modal-desc" rows="3" placeholder="Optional notes…"></textarea>
+          </div>
+          <div class="form-actions">
+            <button type="submit" class="btn btn-primary">Save Changes</button>
+            <button type="button" class="btn btn-danger" id="event-modal-delete">Delete Event</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+  <div class="modal-overlay" id="event-modal-overlay"></div>
+
+  <script src="/static/script.js?v=12"></script>
 </body>
 </html>
