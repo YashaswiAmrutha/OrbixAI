@@ -7,6 +7,10 @@ __pycache__/
 *.pyo
 *.pyd
 *.sqlite3
+# Working memory (SQLite session buffer) + its WAL/SHM sidecars
+*.db
+*.db-wal
+*.db-shm
 
 backend/credentials.json
 backend/token.json
@@ -65,3 +69,5 @@ Thumbs.db
 
 
 Docs/MCP plan.md
+Docs/Everything_for_research_paper(archi).md
+Docs/graph-schema.md
