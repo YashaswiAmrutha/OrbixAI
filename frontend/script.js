@@ -13,6 +13,12 @@ let healthCheckInterval  = null;
 let emailFetchInProgress = false;   // prevent overlapping fetches
 let emailsDisplayed      = false;   // suppress transient errors once emails load
 
+// ── Memory session (persists multi-turn context across reloads) ───────────────
+let chatSessionId = localStorage.getItem("orbix-session")
+  || ((window.crypto && crypto.randomUUID) ? crypto.randomUUID()
+      : "s-" + Date.now() + "-" + Math.random().toString(36).slice(2));
+localStorage.setItem("orbix-session", chatSessionId);
+
 // ── Calendar event state ─────────────────────────────────────────────────────
 let calendarEvents = {};  // { "YYYY-MM-DD": [{id, title, date, time, description, type, source, color}, ...] }
 let selectedCalDate = null;
@@ -213,7 +219,7 @@ async function sendMessage() {
     const res = await fetch(`${API_BASE}/chat/stream`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message })
+      body: JSON.stringify({ message, session_id: chatSessionId })
     });
 
     if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
@@ -242,6 +248,12 @@ async function sendMessage() {
 
         } else if (evt.type === "response") {
           collapseThinking();
+
+          // persist the memory session id returned by the agent
+          if (evt.session_id) {
+            chatSessionId = evt.session_id;
+            localStorage.setItem("orbix-session", chatSessionId);
+          }
 
           // Auto-sync calendar events from AI response
           if (evt.calendar_events && evt.calendar_events.length > 0) {

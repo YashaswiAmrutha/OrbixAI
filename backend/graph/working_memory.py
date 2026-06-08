@@ -206,6 +206,81 @@ def queue_stats() -> dict:
     return {r["status"]: r["c"] for r in rows}
 
 
+def claim_pending(limit: int = 20, session_id: str | None = None,
+                  max_tries: int = 3) -> list[dict]:
+    """
+    Atomically claim a batch of pending turns: select + flip to 'processing' in one
+    transaction, so several workers (in-app + drain-on-startup) never grab the same
+    row. Returns the claimed rows joined with their message text.
+    """
+    with _conn() as con:  # _conn wraps BEGIN/COMMIT -> the claim is atomic
+        where = "q.status = 'pending' AND q.tries < ?"
+        params: list = [max_tries]
+        if session_id:
+            where += " AND q.session_id = ?"
+            params.append(session_id)
+        params.append(limit)
+        rows = con.execute(
+            f"SELECT q.msg_id, q.session_id, q.tries, m.role, m.text, m.ts "
+            f"FROM extract_queue q JOIN messages m ON m.id = q.msg_id "
+            f"WHERE {where} ORDER BY q.msg_id ASC LIMIT ?",
+            params,
+        ).fetchall()
+        for r in rows:
+            con.execute("UPDATE extract_queue SET status = 'processing' WHERE msg_id = ?",
+                        (r["msg_id"],))
+    return [dict(r) for r in rows]
+
+
+def reset_stale_processing() -> int:
+    """Return any rows stuck in 'processing' (from a crash mid-extract) to 'pending'.
+    Call on startup so nothing is permanently stranded."""
+    with _conn() as con:
+        cur = con.execute(
+            "UPDATE extract_queue SET status = 'pending' WHERE status = 'processing'")
+        return cur.rowcount
+
+
+def pending_count(session_id: str | None = None) -> int:
+    """How many turns still await extraction (pending or in-flight)."""
+    with _conn() as con:
+        if session_id:
+            row = con.execute(
+                "SELECT COUNT(*) AS c FROM extract_queue "
+                "WHERE status IN ('pending','processing') AND session_id = ?",
+                (session_id,)).fetchone()
+        else:
+            row = con.execute(
+                "SELECT COUNT(*) AS c FROM extract_queue "
+                "WHERE status IN ('pending','processing')").fetchone()
+    return row["c"]
+
+
+def prune(keep_days: int = 30) -> dict:
+    """
+    Keep SQLite bounded: drop 'done' queue rows and messages older than keep_days
+    that are no longer awaiting extraction. Never deletes pending/processing turns
+    (their facts haven't reached Neo4j yet). Returns counts removed.
+    """
+    cutoff = _now_ms() - keep_days * 86_400_000
+    with _conn() as con:
+        q = con.execute("DELETE FROM extract_queue WHERE status = 'done'").rowcount
+        m = con.execute(
+            "DELETE FROM messages WHERE ts < ? AND id NOT IN "
+            "(SELECT msg_id FROM extract_queue WHERE status IN ('pending','processing'))",
+            (cutoff,)).rowcount
+    return {"queue_rows_removed": q, "messages_removed": m}
+
+
+def vacuum() -> None:
+    """Reclaim file space after pruning (must run outside a transaction)."""
+    con = sqlite3.connect(DB_PATH, timeout=30)
+    try:
+        con.execute("VACUUM;")
+    finally:
+        con.close()
+
+
 # --------------------------------------------------------------------------- #
 # self-test: `python backend/graph/working_memory.py`
 # --------------------------------------------------------------------------- #

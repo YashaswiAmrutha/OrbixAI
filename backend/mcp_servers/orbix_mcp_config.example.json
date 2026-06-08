@@ -1,0 +1,10 @@
+{
+  "_comment": "Example MCP host config. The OrbixAI backend (host) spawns these servers over stdio and exposes their tools to the agent brain. Paths are relative to the repo root; adjust 'command' to your venv python if needed.",
+  "mcpServers": {
+    "orbix-memory": {
+      "command": "python",
+      "args": ["backend/mcp_servers/memory_server.py"],
+      "description": "Long-term memory over Neo4j (recall/search/remember_fact/...). Needs Neo4j running and the root .env credentials."
+    }
+  }
+}

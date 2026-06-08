@@ -1,4 +1,5 @@
-from fastapi import FastAPI, UploadFile, File, Request
+from fastapi import FastAPI, UploadFile, File, Request, BackgroundTasks
+from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
@@ -40,7 +41,28 @@ logging.basicConfig(level=logging.DEBUG)
 # Frontend directory (used for serving static files and index.html)
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """On launch: ensure Ollama is serving, then drain any memory writes left
+    pending from a previous run (drain-on-startup). Never blocks fatally."""
+    try:
+        from mcp_host import startup
+        await asyncio.to_thread(startup.run_startup)
+    except Exception as e:
+        logger.error("Startup orchestration failed (continuing): %s", e, exc_info=True)
+    yield
+
+
+def _drain_session_bg(session_id: str):
+    """Post-reply background extraction so Neo4j stays fresh (runs off the response)."""
+    try:
+        from mcp_host import extractor
+        extractor.drain(session_id=session_id)
+    except Exception as e:
+        logger.error("post-reply drain failed: %s", e)
+
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -589,13 +611,28 @@ async def chat_stream(message: dict):
             if travel_plan_pre and travel_plan_pre.get("itinerary"):
                 parameters["travel_plan"] = travel_plan_pre
 
-            # ── general_chat ────────────────────────────────────────────────
+            # ── general_chat → memory-aware MCP agent ────────────────────────
+            # Conversational/personal queries go through the agent (recall over Neo4j +
+            # background remember). Action intents above stay on the legacy pipeline.
             if intent == "general_chat":
-                yield _sse({"type": "thinking", "step": "Generating response…"})
-                await asyncio.sleep(0)
-                prompt = build_prompt(user_text)
-                reply  = await loop.run_in_executor(None, generate_response, prompt)
-                yield _sse({"type": "response", "reply": reply, "intent": intent})
+                from mcp_host.agent import run_turn
+                sid = (message.get("session_id") or "").strip() or None
+                step_q = asyncio.Queue()
+                agent_task = asyncio.ensure_future(
+                    run_turn(user_text, session_id=sid, on_event=step_q.put))
+                # stream the agent's tool steps into the thinking bubble as they happen
+                while not (agent_task.done() and step_q.empty()):
+                    try:
+                        ev = await asyncio.wait_for(step_q.get(), timeout=0.2)
+                        yield _sse(ev)
+                        await asyncio.sleep(0)
+                    except asyncio.TimeoutError:
+                        continue
+                out = await agent_task
+                # remember-after: extract this turn into Neo4j off the response path
+                asyncio.create_task(asyncio.to_thread(_drain_session_bg, out["session_id"]))
+                yield _sse({"type": "response", "reply": out["reply"],
+                            "intent": "general_chat", "session_id": out["session_id"]})
                 return
 
             # ── travel_planner ──────────────────────────────────────────────
@@ -804,6 +841,34 @@ async def chat_stream(message: dict):
     return StreamingResponse(generate(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
                                       "X-Accel-Buffering": "no"})
+
+
+@app.post("/agent/chat")
+async def agent_chat(message: dict, background_tasks: BackgroundTasks):
+    """
+    Memory-aware agent endpoint: query -> READ-ONLY LLM/MCP recall on Neo4j -> reply.
+    Durable writes happen off-path: a flush-barrier drains this session's pending
+    turns into Neo4j before answering, and a post-reply background task extracts the
+    new turn. Carries a session_id for multi-turn context. Legacy /chat is untouched.
+    """
+    try:
+        from mcp_host.agent import run_turn
+        user_text = message.get("message", "")
+        if not user_text:
+            return {"error": "message is required"}
+        session_id = message.get("session_id")
+        out = await run_turn(user_text, session_id=session_id)
+        # remember-after: extract this turn into Neo4j once the reply is sent
+        background_tasks.add_task(_drain_session_bg, out["session_id"])
+        return {
+            "reply": out["reply"],
+            "session_id": out["session_id"],
+            "tools_used": [{"tool": t["tool"], "readonly": t["readonly"]} for t in out["trace"]],
+        }
+    except Exception as e:
+        logger.error("Agent chat error: %s", e, exc_info=True)
+        return {"error": str(e), "reply": "Agent error — is Ollama running and a "
+                "tool-calling model pulled? Is Neo4j up?"}
 
 
 @app.post("/process-intent")

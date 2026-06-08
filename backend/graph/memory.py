@@ -118,11 +118,14 @@ def upsert_entity(type_: str, name: str | None = None, *, key: str | None = None
     key = key or key_for(type_, name=name, **(props or {}))
     labels = _label_str(type_, sublabels)
     clean = {k: v for k, v in (props or {}).items() if _nonempty(v) and k != "key"}
+    # MERGE on the :Entity mixin + key only, then SET labels additively. This means
+    # re-mentioning an entity with a NEW sub-label (e.g. plain :Person later becoming
+    # :Person:Family) just adds the label instead of colliding on the key constraint.
     rows = _write(
         f"""
-        MERGE (e:Entity:{labels} {{key: $key}})
+        MERGE (e:Entity {{key: $key}})
           ON CREATE SET e.id = randomUUID(), e.created_at = timestamp(), e.source = $source
-        SET e.type = $type, e.name = coalesce($name, e.name),
+        SET e:{labels}, e.type = $type, e.name = coalesce($name, e.name),
             e.updated_at = timestamp(), e.last_seen = timestamp(),
             e += $props
         RETURN e.key AS key
@@ -233,6 +236,14 @@ def forget(key: str) -> bool:
 # --------------------------------------------------------------------------- #
 _SKIP_PROPS = {"id", "created_at", "updated_at", "last_seen", "embedding"}
 
+# Salient scalar fields of a 1-hop neighbor to inline into recall(), so common
+# single-hop questions are answerable without the model chaining a second recall.
+_NEIGHBOR_PROPS = {
+    "birthday", "anniversary", "date", "email", "phone", "city", "country",
+    "value", "status", "due_date", "start_date", "end_date", "deadline",
+    "role", "relationship", "recurrence", "title", "category",
+}
+
 
 def recall(subject_key: str) -> dict | None:
     """
@@ -252,7 +263,8 @@ def recall(subject_key: str) -> dict | None:
                [x IN facts WHERE x IS NOT NULL] AS facts,
                collect(DISTINCT CASE WHEN o IS NULL THEN null ELSE
                  {rel: type(r), name: o.name, key: o.key,
-                  labels: [l IN labels(o) WHERE l <> 'Entity']} END) AS rels
+                  labels: [l IN labels(o) WHERE l <> 'Entity'],
+                  props: properties(o)} END) AS rels
         """,
         key=subject_key,
     )
@@ -261,12 +273,24 @@ def recall(subject_key: str) -> dict | None:
     r = rows[0]
     node = dict(r["node"])
     props = {k: v for k, v in node.items() if k not in _SKIP_PROPS}
+    rels = []
+    for x in r["rels"]:
+        if x is None:
+            continue
+        # include a few salient neighbor props inline so single-hop questions
+        # ("mom's birthday", "colleague's email") are answerable from one recall.
+        detail = {k: v for k, v in (x.get("props") or {}).items()
+                  if k in _NEIGHBOR_PROPS and v is not None}
+        entry = {"rel": x["rel"], "name": x["name"], "key": x["key"], "labels": x["labels"]}
+        if detail:
+            entry["details"] = detail
+        rels.append(entry)
     return {
         "key": subject_key,
         "labels": [l for l in r["node"].labels if l != "Entity"],
         "properties": props,
         "facts": r["facts"],
-        "relationships": [x for x in r["rels"] if x is not None],
+        "relationships": rels,
     }
 
 
