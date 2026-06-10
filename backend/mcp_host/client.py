@@ -29,16 +29,25 @@ logger = logging.getLogger(__name__)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _MEMORY_SERVER = _REPO_ROOT / "backend" / "mcp_servers" / "memory_server.py"
+_TRAVEL_SERVER = (
+    _REPO_ROOT /
+    "backend" /
+    "mcp_servers" /
+    "travel_server.py"
+)
 
 # Default server roster. Use the current interpreter + absolute paths so spawning
 # never depends on PATH or the working directory. Add gmail/calendar/web here later.
-DEFAULT_SERVERS: dict[str, dict] = {
+DEFAULT_SERVERS = {
     "orbix-memory": {
         "command": sys.executable,
         "args": [str(_MEMORY_SERVER)],
     },
+    "orbix-travel": {
+        "command": sys.executable,
+        "args": [str(_TRAVEL_SERVER)],
+    },
 }
-
 
 def load_servers(config_path: str | Path | None = None) -> dict[str, dict]:
     """Load a server roster from a JSON file ({"mcpServers": {...}}), or the default."""
