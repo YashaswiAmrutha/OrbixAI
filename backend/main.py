@@ -13,6 +13,8 @@ from google_service.travel_planner import plan_trip
 from intent_workflow import IntentClassifier, WorkflowExecutor, WorkflowTask
 from calendar_store import get_events, create_event, bulk_create_events, update_event, delete_event
 from faster_whisper import WhisperModel
+from graph.working_memory import init_db as init_working_memory, cleanup_expired_messages
+from orchestration.workflow import run_workflow
 import asyncio
 import tempfile
 import json
@@ -44,7 +46,15 @@ FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """On launch: ensure Ollama is serving, then drain any memory writes left
-    pending from a previous run (drain-on-startup). Never blocks fatally."""
+    pending from a previous run (drain-on-startup). Initialize SQLite schema.
+    Never blocks fatally."""
+    try:
+        # Initialize SQLite working memory (creates tables if needed)
+        init_working_memory()
+        logger.info("Working memory SQLite initialized")
+    except Exception as e:
+        logger.error(f"Working memory init failed: {e}", exc_info=True)
+    
     try:
         from mcp_host import startup
         await asyncio.to_thread(startup.run_startup)
@@ -60,6 +70,15 @@ def _drain_session_bg(session_id: str):
         extractor.drain(session_id=session_id)
     except Exception as e:
         logger.error("post-reply drain failed: %s", e)
+
+
+def _cleanup_expired_messages_bg():
+    """Daily cleanup: delete expired SQLite messages (24hr lifespan)."""
+    try:
+        result = cleanup_expired_messages()
+        logger.info(f"Expired messages cleanup: {result}")
+    except Exception as e:
+        logger.error(f"Cleanup failed: {e}")
 
 
 app = FastAPI(lifespan=lifespan)
@@ -410,6 +429,64 @@ def auth_callback(request: Request):
 @app.get("/health")
 def health_check():
     return {"message": "Orbii Backend API is running", "status": "ok"}
+
+
+# ============ LANGGRAPH WORKFLOW ENDPOINTS (Phase 1) ============
+
+@app.post("/workflow/chat")
+async def workflow_chat(message: dict):
+    """
+    LangGraph workflow endpoint — Phase 1 testing.
+    
+    Request: {"message": "...", "session_id": "..."}
+    Response: Streaming SSE events
+      - {type: "thinking", step: "..."}
+      - {type: "response", reply: "...", module: "..."}
+    """
+    user_message = message.get("message", "").strip()
+    session_id = (message.get("session_id") or "").strip()
+    
+    if not user_message:
+        return {"error": "message is required"}
+    
+    if not session_id:
+        from graph.working_memory import start_session
+        session_id = start_session()
+    
+    logger.info(f"[LangGraph] Starting workflow for session {session_id}")
+    
+    async def generate():
+        """Stream SSE events from workflow execution."""
+        try:
+            yield f'data: {json.dumps({"type": "thinking", "step": "Starting workflow..."})}\n\n'
+            
+            # Run the LangGraph workflow
+            final_state = await run_workflow(user_message, session_id)
+            
+            # Extract response from final state
+            response = final_state.get("module_output", {}).get("formatted", "No response")
+            module = final_state.get("module_output", {}).get("module", "unknown")
+            
+            logger.info(f"[LangGraph] Workflow completed: module={module}")
+            
+            yield f'data: {json.dumps({"type": "response", "reply": response, "module": module, "session_id": session_id})}\n\n'
+            
+        except Exception as e:
+            logger.error(f"Workflow error: {e}", exc_info=True)
+            yield f'data: {json.dumps({"type": "error", "message": str(e)})}\n\n'
+    
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+@app.post("/workflow/cleanup")
+async def workflow_cleanup_now(background_tasks: BackgroundTasks):
+    """
+    Manually trigger cleanup of expired SQLite messages (for testing).
+    Normally this would run on a schedule (daily).
+    """
+    background_tasks.add_task(_cleanup_expired_messages_bg)
+    return {"status": "cleanup queued"}
+
 
 
 # ============ CALENDAR ENDPOINTS ============
