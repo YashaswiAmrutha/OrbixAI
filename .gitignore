@@ -72,3 +72,13 @@ Thumbs.db
 Docs/MCP plan.md
 Docs/Everything_for_research_paper(archi).md
 Docs/graph-schema.md
+
+# OAuth
+credentials.json
+token.json
+
+# Generated data
+backend/events.json
+
+# Local files
+.env

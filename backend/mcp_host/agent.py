@@ -42,7 +42,7 @@ import extractor  # type: ignore  # noqa: E402
 logger = logging.getLogger(__name__)
 
 # A tool-calling model. Override with env ORBIX_AGENT_MODEL.
-AGENT_MODEL = os.environ.get("ORBIX_AGENT_MODEL", "llama3.1:8b")
+AGENT_MODEL = os.environ.get("ORBIX_AGENT_MODEL", "qwen2.5:3b")
 MAX_STEPS = int(os.environ.get("ORBIX_AGENT_MAX_STEPS", "6"))
 # Match the project's CPU-only Ollama setup (CUDA issues on this machine).
 _OPTIONS = {"temperature": 0.2, "num_gpu": int(os.environ.get("OLLAMA_NUM_GPU", "0"))}
@@ -134,8 +134,15 @@ async def run_turn(user_text: str, session_id: str | None = None, *,
     async with MCPClientManager() as mcp:
         # READ-ONLY agent: the brain only retrieves; all writes go through the
         # background extractor (single write path -> no races, no duplication).
-        tools = [t for t in mcp.ollama_tools()
-                 if mcp.is_readonly(t["function"]["name"])]
+        #tools = mcp.ollama_tools()
+        tools = [
+            t for t in mcp.ollama_tools()
+            if t["function"]["name"] in (
+                "geocode_address",
+                "find_ev_charging_stations",
+                "find_nearby_places"
+            )
+        ]
         logger.info("Agent turn: model=%s, %d read tools available", model, len(tools))
 
         reply = ""
@@ -144,6 +151,14 @@ async def run_turn(user_text: str, session_id: str | None = None, *,
                                   tools=tools, options=_OPTIONS)
             msg = resp.message
             calls = msg.tool_calls or []
+
+            print("\nSTEP", step)
+            print("MODEL SAID:", msg.content)
+
+            if calls:
+                print("TOOL CALLS:")
+                for c in calls:
+                    print("  ", c.function.name, dict(c.function.arguments or {}))
 
             # reconstruct the assistant message (with any tool calls) into history
             asst: dict = {"role": "assistant", "content": msg.content or ""}
@@ -174,9 +189,39 @@ async def run_turn(user_text: str, session_id: str | None = None, *,
         else:
             # exhausted steps without a final plain answer
             reply = reply or "I wasn't able to complete that — too many tool steps."
+            
+    # Generate short voice-friendly summary
+    voice_reply = reply
+
+    if len(reply) > 250:
+        try:
+            summary_resp = await llm.chat(
+                model=model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Summarize the response for text-to-speech. "
+                            "Maximum 3 sentences. "
+                            "Maximum 50 words. "
+                            "Keep only the most important information."
+                        )
+                    },
+                    {
+                        "role": "user",
+                        "content": reply
+                    }
+                ],
+                options=_OPTIONS
+            )
+
+            voice_reply = summary_resp.message.content.strip()
+
+        except Exception:
+            voice_reply = reply[:200]
 
     wm.add_message(session_id, "assistant", reply, enqueue=False)
-    return {"reply": reply, "session_id": session_id,
+    return {"reply": reply, "session_id": session_id, "voice_reply": voice_reply,
             "trace": trace, "steps": len(trace)}
 
 

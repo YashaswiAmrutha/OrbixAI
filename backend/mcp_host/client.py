@@ -16,6 +16,7 @@ across requests is a later optimization.
         result = await mcp.call_tool("recall", {"subject_key": "user:self"})
 """
 
+from json import tool
 import sys
 import json
 import logging
@@ -47,6 +48,10 @@ DEFAULT_SERVERS = {
         "command": sys.executable,
         "args": [str(_TRAVEL_SERVER)],
     },
+    "osm-mcp": {
+    "command": "uvx",
+    "args": ["osm-mcp-server"]
+},
 }
 
 def load_servers(config_path: str | Path | None = None) -> dict[str, dict]:
@@ -95,7 +100,11 @@ class MCPClientManager:
             await session.initialize()
             self.sessions[name] = session
             listed = await session.list_tools()
+            print(f"\nSERVER: {name}")
+
             for tool in listed.tools:
+                print("  TOOL:", tool.name)
+
                 if tool.name in self.tool_index:
                     logger.warning("Tool name collision %r (servers %s / %s)",
                                    tool.name, self.tool_index[tool.name][0], name)

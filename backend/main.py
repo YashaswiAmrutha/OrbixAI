@@ -862,6 +862,7 @@ async def agent_chat(message: dict, background_tasks: BackgroundTasks):
         background_tasks.add_task(_drain_session_bg, out["session_id"])
         return {
             "reply": out["reply"],
+            "voice_reply": out.get("voice_reply", out["reply"]),
             "session_id": out["session_id"],
             "tools_used": [{"tool": t["tool"], "readonly": t["readonly"]} for t in out["trace"]],
         }

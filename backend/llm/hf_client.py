@@ -10,7 +10,7 @@ The fine-tuned model (gpraneeth555/Llama-3-13k) returns tool calls in the form:
 This module parses those tool calls and maps them to OrbixAI's internal
 intent schema so the existing workflow pipeline stays untouched.
 
-Fallback chain:  fine-tuned model → llama3.1:8b → safe default
+Fallback chain:  fine-tuned model → qwen2.5:3b → safe default
 """
 
 import json
@@ -20,7 +20,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 ORCHESTRATOR_MODEL = "gpraneeth555/Llama-3-13k:latest"
-FALLBACK_MODEL     = "llama3.1:8b"
+FALLBACK_MODEL     = "qwen2.5:3b"
 
 # ── GPU workaround: model must run on CPU (CUDA runtime issue on this machine) ─
 _OLLAMA_OPTIONS = {"temperature": 0.1, "num_predict": 1024, "num_gpu": 0}
@@ -340,7 +340,7 @@ def orchestrate(user_query: str) -> dict:
 def chat_response(user_query: str) -> str:
     """
     Generate a plain-text conversational reply.
-    Uses fine-tuned model first, falls back to llama3.1:8b.
+    Uses fine-tuned model first, falls back to qwen2.5:3b.
     """
     import ollama
 
