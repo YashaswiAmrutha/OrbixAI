@@ -15,3 +15,5 @@ python-dotenv
 neo4j
 PyYAML
 mcp
+langgraph
+langchain

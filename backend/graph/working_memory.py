@@ -46,9 +46,12 @@ CREATE TABLE IF NOT EXISTS messages (
     role        TEXT NOT NULL,            -- user | assistant | system
     text        TEXT NOT NULL,
     ts          INTEGER NOT NULL,
+    created_at  INTEGER DEFAULT (strftime('%s', 'now')),
+    expires_at  INTEGER DEFAULT (strftime('%s', 'now') + 86400),  -- 24hrs
     FOREIGN KEY (session_id) REFERENCES sessions(id)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
+CREATE INDEX IF NOT EXISTS idx_messages_expires ON messages(expires_at);
 
 CREATE TABLE IF NOT EXISTS extract_queue (
     msg_id      INTEGER PRIMARY KEY,      -- one queue row per message
@@ -58,6 +61,32 @@ CREATE TABLE IF NOT EXISTS extract_queue (
     FOREIGN KEY (msg_id) REFERENCES messages(id)
 );
 CREATE INDEX IF NOT EXISTS idx_queue_status ON extract_queue(status, tries);
+
+CREATE TABLE IF NOT EXISTS retry_queue (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    task_type   TEXT NOT NULL,            -- send_email, create_meeting, cache_travel, etc
+    task_data   TEXT NOT NULL,            -- JSON-serialized task
+    attempt     INTEGER NOT NULL DEFAULT 1,
+    max_attempts INTEGER NOT NULL DEFAULT 3,
+    last_error  TEXT,
+    next_retry_at INTEGER NOT NULL,
+    created_at  INTEGER DEFAULT (strftime('%s', 'now')),
+    updated_at  INTEGER DEFAULT (strftime('%s', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_retry_next ON retry_queue(next_retry_at, session_id);
+
+CREATE TABLE IF NOT EXISTS workflow_checkpoints (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    step_name   TEXT NOT NULL,            -- route_query, chat_node, background_tasks, etc
+    state_json  TEXT NOT NULL,            -- OrbixState serialized to JSON
+    status      TEXT NOT NULL DEFAULT 'in_progress',  -- in_progress | completed | failed
+    error_details TEXT,
+    created_at  INTEGER DEFAULT (strftime('%s', 'now')),
+    updated_at  INTEGER DEFAULT (strftime('%s', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_checkpoint_session ON workflow_checkpoints(session_id, step_name);
 """
 
 
@@ -279,6 +308,167 @@ def vacuum() -> None:
         con.execute("VACUUM;")
     finally:
         con.close()
+
+
+# --------------------------------------------------------------------------- #
+# retry_queue (for failed action chaining tasks)
+# --------------------------------------------------------------------------- #
+
+def add_retry_task(session_id: str, task_type: str, task_data: dict,
+                   next_retry_at: int | None = None, max_attempts: int = 3) -> int:
+    """
+    Enqueue a task for retry (e.g., send_email failed, retry in 5min).
+    
+    Returns the retry queue id.
+    """
+    import json
+    if next_retry_at is None:
+        next_retry_at = int(time.time()) + 300  # 5min from now
+    
+    with _conn() as con:
+        cur = con.execute(
+            "INSERT INTO retry_queue "
+            "(session_id, task_type, task_data, attempt, max_attempts, next_retry_at) "
+            "VALUES (?, ?, ?, 1, ?, ?)",
+            (session_id, task_type, json.dumps(task_data), max_attempts, next_retry_at),
+        )
+        return cur.lastrowid
+
+
+def get_retry_tasks_due(limit: int = 20) -> list[dict]:
+    """
+    Fetch tasks ready to retry (next_retry_at <= now, attempt < max_attempts).
+    """
+    import json
+    now = int(time.time())
+    with _conn() as con:
+        rows = con.execute(
+            "SELECT id, session_id, task_type, task_data, attempt, max_attempts, last_error "
+            "FROM retry_queue "
+            "WHERE next_retry_at <= ? AND attempt < max_attempts "
+            "ORDER BY next_retry_at ASC LIMIT ?",
+            (now, limit),
+        ).fetchall()
+    
+    result = []
+    for r in rows:
+        result.append({
+            "id": r["id"],
+            "session_id": r["session_id"],
+            "task_type": r["task_type"],
+            "task_data": json.loads(r["task_data"]),
+            "attempt": r["attempt"],
+            "max_attempts": r["max_attempts"],
+            "last_error": r["last_error"],
+        })
+    return result
+
+
+def update_retry_task(retry_id: int, attempt: int, next_retry_at: int | None = None,
+                      error: str | None = None) -> None:
+    """
+    Update a retry task: increment attempt, set next retry time, log error.
+    If attempt >= max_attempts, mark as abandoned (status='abandoned').
+    """
+    with _conn() as con:
+        if next_retry_at is None:
+            # Exponential backoff: 5min * 2^(attempt-1)
+            next_retry_at = int(time.time()) + (300 * (2 ** (attempt - 1)))
+        
+        con.execute(
+            "UPDATE retry_queue "
+            "SET attempt = ?, next_retry_at = ?, last_error = ?, updated_at = ? "
+            "WHERE id = ?",
+            (attempt, next_retry_at, error, int(time.time()), retry_id),
+        )
+
+
+def mark_retry_abandoned(retry_id: int, error: str | None = None) -> None:
+    """Mark a retry task as permanently abandoned (max attempts exceeded)."""
+    with _conn() as con:
+        con.execute(
+            "DELETE FROM retry_queue WHERE id = ?",
+            (retry_id,),
+        )
+
+
+def cleanup_expired_messages() -> dict:
+    """
+    Daily cleanup: delete expired messages (older than 24hrs).
+    First verify no pending extractions exist for the session.
+    
+    Returns counts removed.
+    """
+    now = int(time.time())
+    with _conn() as con:
+        # Find sessions that have expired messages but no pending extractions
+        sessions_to_clean = con.execute(
+            "SELECT DISTINCT m.session_id FROM messages m "
+            "WHERE m.expires_at < ? "
+            "AND m.session_id NOT IN "
+            "  (SELECT DISTINCT session_id FROM extract_queue WHERE status IN ('pending', 'processing'))",
+            (now,),
+        ).fetchall()
+        
+        cleaned_count = 0
+        for row in sessions_to_clean:
+            session_id = row["session_id"]
+            # Delete expired messages from this session
+            cur = con.execute(
+                "DELETE FROM messages WHERE session_id = ? AND expires_at < ?",
+                (session_id, now),
+            )
+            cleaned_count += cur.rowcount
+    
+    return {"messages_removed": cleaned_count, "sessions_cleaned": len(sessions_to_clean)}
+
+
+# --------------------------------------------------------------------------- #
+# workflow_checkpoints (for LangGraph state persistence, Phase 2)
+# --------------------------------------------------------------------------- #
+
+def save_checkpoint(session_id: str, step_name: str, state_json: str,
+                    status: str = "in_progress") -> int:
+    """
+    Save a LangGraph workflow checkpoint.
+    
+    Returns checkpoint id.
+    """
+    with _conn() as con:
+        cur = con.execute(
+            "INSERT INTO workflow_checkpoints "
+            "(session_id, step_name, state_json, status) "
+            "VALUES (?, ?, ?, ?)",
+            (session_id, step_name, state_json, status),
+        )
+        return cur.lastrowid
+
+
+def get_latest_checkpoint(session_id: str) -> dict | None:
+    """
+    Get the most recent checkpoint for a session (in_progress or completed).
+    """
+    import json
+    with _conn() as con:
+        row = con.execute(
+            "SELECT id, session_id, step_name, state_json, status, created_at "
+            "FROM workflow_checkpoints "
+            "WHERE session_id = ? AND status IN ('in_progress', 'completed') "
+            "ORDER BY created_at DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+    
+    if row is None:
+        return None
+    
+    return {
+        "id": row["id"],
+        "session_id": row["session_id"],
+        "step_name": row["step_name"],
+        "state_json": json.loads(row["state_json"]),
+        "status": row["status"],
+        "created_at": row["created_at"],
+    }
 
 
 # --------------------------------------------------------------------------- #
