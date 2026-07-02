@@ -667,12 +667,12 @@ async def chat_stream(message: dict):
 
                 if "error" in travel_result:
                     yield _sse({"type": "response",
-                                "reply": travel_result["error"],
+                                "reply": travel_result.get("error", "Something went wrong"),
                                 "intent": intent})
                     return
 
                 # Build reply from result
-                dest      = travel_result["entities"].get("to_city", "your destination")
+                dest      = (travel_result.get("entities") or {}).get("to_city", "your destination")
                 itinerary = travel_result.get("itinerary", "")
                 flights   = travel_result.get("flights", [])
                 hotels    = travel_result.get("hotels", [])
@@ -696,7 +696,7 @@ async def chat_stream(message: dict):
                 cal_ev_defs = extract_travel_calendar_events(
                     itinerary,
                     dest,
-                    travel_result["entities"].get("departure_date"),
+                    (travel_result.get("entities") or {}).get("departure_date"),
                 )
                 saved_cal_events = bulk_create_events(cal_ev_defs)
                 todo_items = [{"text": f"Plan trip to {dest}", "source": "ai_travel"}]

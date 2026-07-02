@@ -42,7 +42,8 @@ def _rule_based_extract(user_query: str) -> dict | None:
 
     wants_meet   = any(w in q for w in ('meet', 'google meet', 'gmeet', 'video call', 'conference', 'schedule'))
     wants_email  = any(w in q for w in ('email', 'mail', 'send', 'message'))
-    wants_travel = any(w in q for w in ('trip', 'travel', 'itinerary', 'plan a trip', 'visit', 'fly to', 'going to', 'holiday', 'vacation'))
+    wants_travel = any(w in q for w in ('trip', 'travel', 'itinerary', 'plan a trip', 'visit', 'fly to','going to', 'holiday', 'vacation', 'road trip', 'resort', 'resorts','must see', 'places to visit', 'tourist', 'sightseeing', 'tour',
+    'journey', 'route', 'drive to','weekend trip', 'getaway'))
     wants_inbox  = any(w in q for w in ('check email', 'read email', 'my inbox', 'show email', 'latest email', 'check my email', 'inbox'))
 
     # If none of the known intent signals present, hand off to model
@@ -65,13 +66,24 @@ def _rule_based_extract(user_query: str) -> dict | None:
         params.setdefault('event_title', 'Meeting')
 
     # Destination extraction for travel
+    # Destination extraction for travel (case-insensitive, handles from/to patterns)
     if wants_travel:
-        dest_m = re.search(
-            r'(?:to|trip to|travel to|visit|going to|fly to)\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)',
-            user_query
+        # Pattern 1: "from X to Y" — destination is Y, origin is X
+        route_m = re.search(
+            r'from\s+([a-zA-Z]+(?:\s+[a-zA-Z]+)?)\s+to\s+([a-zA-Z]+(?:\s+[a-zA-Z]+)?)',
+            user_query, re.IGNORECASE
         )
-        if dest_m:
-            params['destination'] = dest_m.group(1)
+        if route_m:
+            params['origin']      = route_m.group(1).strip().title()
+            params['destination'] = route_m.group(2).strip().title()
+        else:
+            # Pattern 2: "to/visit/in X" — destination is X
+            dest_m = re.search(
+                r'(?:to|trip to|travel to|visit|going to|fly to|in|around|near)\s+([a-zA-Z]+(?:\s+[a-zA-Z]+)?)',
+                user_query, re.IGNORECASE
+            )
+            if dest_m:
+                params['destination'] = dest_m.group(1).strip().title()
 
     # Determine intent
     if wants_meet and (wants_email or emails):
@@ -80,8 +92,8 @@ def _rule_based_extract(user_query: str) -> dict | None:
         intent = 'create_meeting'
     elif wants_email and emails:
         intent = 'send_email'
-    elif wants_travel and params.get('destination'):
-        intent = 'travel_planner'
+    elif wants_travel:
+        intent = 'travel_planner'   # always route travel — phi4-mini handles missing destination
     elif wants_inbox:
         intent = 'get_emails'
     else:
