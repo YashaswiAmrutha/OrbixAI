@@ -216,11 +216,20 @@ async function sendMessage() {
   showThinking();
 
   try {
-    const res = await fetch(`${API_BASE}/chat/stream`, {
+    // Primary path: LangGraph orchestration workflow (route → context → module).
+    // Falls back to the legacy /chat/stream pipeline if the workflow errors.
+    let res = await fetch(`${API_BASE}/workflow/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ message, session_id: chatSessionId })
     });
+    if (!res.ok) {
+      res = await fetch(`${API_BASE}/chat/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message, session_id: chatSessionId })
+      });
+    }
 
     if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
 

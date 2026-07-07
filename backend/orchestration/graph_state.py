@@ -26,6 +26,7 @@ class OrbixState(TypedDict, total=False):
     intent: str                        # "general_chat" | "travel_planning" | "action" | "combined"
     confidence: float                  # 0.0 to 1.0
     module_name: str                   # Which module to call: "chat" | "travel" | "action"
+    classification: Dict[str, Any]     # Full IntentClassifier output (params/email_content/travel_plan)
     
     # === Context Retrieval ===
     transcript: List[Dict[str, str]]   # SQLite conversation history [{role, text}, ...]
@@ -33,6 +34,8 @@ class OrbixState(TypedDict, total=False):
     
     # === Processing ===
     module_output: Dict[str, Any]      # {"response": str, "data": any, "module": str}
+    calendar_events: List[Dict[str, Any]]  # Events to auto-sync into the frontend calendar
+    todo_items: List[Dict[str, Any]]       # Todo items to auto-add in the frontend
     
     # === Action Chaining (Phase 4) ===
     follow_up_actions: List[str]       # Actions to chain after module completes
@@ -62,9 +65,12 @@ def new_state(user_query: str, session_id: str) -> OrbixState:
         "intent": "",
         "confidence": 0.0,
         "module_name": "",
+        "classification": {},
         "transcript": [],
         "retrieved_facts": {},
         "module_output": {},
+        "calendar_events": [],
+        "todo_items": [],
         "follow_up_actions": [],
         "execution_mode": "sequential",
         "follow_up_context": {},

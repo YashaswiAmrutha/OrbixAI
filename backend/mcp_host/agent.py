@@ -37,7 +37,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "graph"))
 
 from client import MCPClientManager  # type: ignore  # noqa: E402
 import working_memory as wm  # type: ignore  # noqa: E402
-import extractor  # type: ignore  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -117,14 +116,12 @@ async def run_turn(user_text: str, session_id: str | None = None, *,
     session_id = session_id or uuid.uuid4().hex
     wm.start_session(session_id)
 
-    # FLUSH-BARRIER: persist this session's still-pending turns into Neo4j BEFORE we
-    # answer the next query, so recall() sees the latest facts (diagram: "saving into
-    # DB before LLM replies next query"). No-op on the first turn / when nothing pending.
-    if wm.pending_count(session_id):
-        await emit("Saving what you told me…")
-        await asyncio.to_thread(extractor.drain, session_id=session_id)
-
-    wm.add_message(session_id, "user", user_text)   # working memory (instant)
+    # NOTE: the old flush-barrier (drain SQLite queue -> Neo4j before replying) has been
+    # removed. Durable memory writes now happen exclusively through the LangGraph
+    # background write path (orchestration.background_tasks -> extraction_executor).
+    # The user turn is still recorded in working memory for transcript context, but is
+    # NOT enqueued for the retired queue-drain pathway.
+    wm.add_message(session_id, "user", user_text, enqueue=False)   # working memory (instant)
 
     model = model or AGENT_MODEL
     llm = AsyncClient()

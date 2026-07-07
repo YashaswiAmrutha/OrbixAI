@@ -78,8 +78,8 @@ def itinerary_tool(
     num_days: int,
     check_in: str,
     num_adults: int = 1,
-    flight_summary: str = None,
-    hotel_summary: str = None
+    flight_summary: str | None = None,
+    hotel_summary: str | None = None
 ):
 
     result = generate_itinerary(

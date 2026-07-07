@@ -91,8 +91,13 @@ async def generate_itinerary_mcp(
         }
     )
 
+    # Defensive: the itinerary is a plain string wrapped as JSON. If it comes back
+    # empty or non-JSON, return the raw text (or "") instead of crashing.
     if result.content:
-        return json.loads(result.content[0].text)
-
-    return []
+        text = getattr(result.content[0], "text", "") or ""
+        try:
+            return json.loads(text)
+        except Exception:
+            return text
+    return ""
     

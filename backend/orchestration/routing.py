@@ -38,64 +38,82 @@ _INTENT_PATTERNS = {
 }
 
 
+# Map intent → LangGraph module node
+_MODULE_MAP = {
+    "send_email": "action",
+    "create_meeting": "action",
+    "meeting_and_email": "action",
+    "schedule_meeting": "action",
+    "get_emails": "action",
+    "travel_planner": "travel",
+    "general_chat": "chat",
+}
+
+
+def _regex_route(user_query: str):
+    """Fallback rule-based detection. Returns (intent, confidence)."""
+    ql = user_query.lower()
+    for intent, patterns in _INTENT_PATTERNS.items():
+        for pattern in patterns:
+            if re.search(pattern, ql, re.IGNORECASE):
+                return intent, 0.95
+    return "general_chat", 0.5
+
+
 def route_query(state: OrbixState) -> OrbixState:
     """
     Route user query to the appropriate module.
-    
-    Returns state with:
-      - intent: the detected intent name
-      - confidence: 0.0-1.0 (how confident we are)
-      - module_name: "chat" | "travel" | "action"
-    
-    Routing logic:
-      1. Rule-based regex patterns (fast, high confidence)
-      2. If no match, default to "general_chat"
-      3. (Phase 2 option: LLM fallback for ambiguous queries)
+
+    Tier 1: fine-tuned IntentClassifier (LLM) — same brain the legacy /chat path
+            uses, so routing quality matches. Its full output (parameters,
+            email_content, travel_plan) is stashed in state["classification"]
+            so action_node can reuse it without a second LLM call.
+    Tier 2: regex rules as a fast fallback when the LLM is unavailable.
     """
-    user_query = state["user_query"].lower()
-    
-    # Tier 1: Rule-based detection
-    best_intent = None
-    best_confidence = 0.0
-    
-    for intent, patterns in _INTENT_PATTERNS.items():
-        for pattern in patterns:
-            if re.search(pattern, user_query, re.IGNORECASE):
-                # Rule-based hit → high confidence
-                best_intent = intent
-                best_confidence = 0.95
-                break
-        
-        if best_confidence > 0.9:
-            break
-    
-    # If no rule matches, default to general_chat
-    if not best_intent:
-        best_intent = "general_chat"
-        best_confidence = 0.5
-    
-    # Map intent to module
-    module_map = {
-        "send_email": "action",
-        "create_meeting": "action",
-        "meeting_and_email": "action",
-        "schedule_meeting": "action",
-        "get_emails": "action",
-        "travel_planner": "travel",
-        "general_chat": "chat",
-    }
-    
-    module_name = module_map.get(best_intent, "chat")
-    
-    state["intent"] = best_intent
-    state["confidence"] = best_confidence
+    user_query = state["user_query"]
+
+    intent = None
+    confidence = 0.0
+    classification = {}
+
+    # Tier 1: LLM classifier
+    try:
+        from intent_workflow.intent_classifier import IntentClassifier
+        classification = IntentClassifier.classify(user_query) or {}
+        intent = classification.get("intent")
+        confidence = float(classification.get("confidence", 0.9) or 0.9)
+        if intent:
+            logger.info(f"LLM classifier → intent={intent} (confidence={confidence:.2f})")
+    except Exception as e:
+        logger.warning(f"LLM classifier failed ({e}); falling back to regex routing")
+
+    # Tier 2: regex fallback
+    if not intent:
+        intent, confidence = _regex_route(user_query)
+        logger.info(f"Regex router → intent={intent} (confidence={confidence:.2f})")
+
+    # Normalize params so action_node has both recipient_email / attendee_email
+    params = classification.get("parameters", {}) if isinstance(classification, dict) else {}
+    if "attendee_email" in params and "recipient_email" not in params:
+        params["recipient_email"] = params["attendee_email"]
+    elif "recipient_email" in params and "attendee_email" not in params:
+        params["attendee_email"] = params["recipient_email"]
+
+    # Auto-upgrade create_meeting → meeting_and_email when an email is present
+    if intent == "create_meeting" and (params.get("attendee_email") or params.get("recipient_email")):
+        intent = "meeting_and_email"
+        if isinstance(classification, dict):
+            classification["intent"] = intent
+
+    module_name = _MODULE_MAP.get(intent, "chat")
+
+    state["intent"] = intent
+    state["confidence"] = confidence
     state["module_name"] = module_name
+    state["classification"] = classification if isinstance(classification, dict) else {}
     state["step"] = f"route_query → {module_name}"
-    
-    logger.info(
-        f"Routed query to {module_name} (intent={best_intent}, confidence={best_confidence:.2f})"
-    )
-    
+
+    logger.info(f"Routed query to {module_name} (intent={intent}, confidence={confidence:.2f})")
     return state
 
 

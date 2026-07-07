@@ -12,24 +12,103 @@ Phase 2: Real module integration with agent, travel planner, and action executor
 """
 
 import logging
-import json
-import asyncio
+import re
 import time
-from typing import Literal
-from uuid import uuid4
 
 from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
 
 from .graph_state import OrbixState, new_state
 from .routing import route_query, determine_module
-from graph.working_memory import add_message, get_messages
+from graph.working_memory import add_message, get_messages, start_session
 
 logger = logging.getLogger(__name__)
 
 
 # ============================================================================ #
-# Node Implementations (Phase 1 Stubs)
+# Progress streaming
+# ---------------------------------------------------------------------------- #
+# Nodes emit short human-readable steps; the API layer registers a callback per
+# session_id and forwards them to the frontend as SSE "thinking" events.
+# ============================================================================ #
+
+_PROGRESS_EMITTERS = {}
+
+
+def register_progress_emitter(session_id, fn):
+    """Register a callback(str) that receives progress steps for a session."""
+    if session_id and callable(fn):
+        _PROGRESS_EMITTERS[session_id] = fn
+
+
+def unregister_progress_emitter(session_id):
+    _PROGRESS_EMITTERS.pop(session_id, None)
+
+
+def _emit(state, msg):
+    """Emit a progress step to the registered listener (if any) + the log."""
+    fn = _PROGRESS_EMITTERS.get(state.get("session_id"))
+    if fn:
+        try:
+            fn(msg)
+        except Exception:
+            pass
+    logger.info("[workflow] %s", msg)
+
+
+def _travel_calendar_events(itinerary: str, destination: str, departure_date: str = None) -> list:
+    """Parse a day-wise itinerary into calendar event dicts (mirrors main.py)."""
+    from datetime import datetime, timedelta
+    events = []
+    base_date = None
+    if departure_date:
+        try:
+            base_date = datetime.strptime(departure_date, "%Y-%m-%d")
+        except Exception:
+            pass
+    if not base_date:
+        base_date = datetime.utcnow()
+
+    pattern = re.compile(r'day\s+(\d+)[:\s\-–]+([^\n]+)', re.IGNORECASE)
+    matches = pattern.findall(itinerary or "")
+    if matches:
+        for day_str, title in matches:
+            day_num = int(day_str)
+            event_date = base_date + timedelta(days=day_num - 1)
+            events.append({
+                "title": f"Day {day_num}: {title.strip()[:70]}",
+                "date": event_date.strftime("%Y-%m-%d"),
+                "time": "",
+                "description": f"Trip to {destination}",
+                "type": "travel",
+                "source": "ai_travel",
+            })
+    else:
+        events.append({
+            "title": f"Trip to {destination}",
+            "date": base_date.strftime("%Y-%m-%d"),
+            "time": "",
+            "description": (itinerary or "")[:400],
+            "type": "travel",
+            "source": "ai_travel",
+        })
+    return events
+
+
+def _get_gmail_client():
+    """Best-effort authenticated Gmail client (None if not authenticated)."""
+    try:
+        from google_service.gmail_client import GmailClient
+        client = GmailClient()
+        if not client.is_authenticated():
+            client._try_load_token()
+        return client if client.is_authenticated() else None
+    except Exception as e:
+        logger.error(f"Gmail client init failed: {e}")
+        return None
+
+
+# ============================================================================ #
+# Node Implementations
 # ============================================================================ #
 
 def prepare_context(state: OrbixState) -> OrbixState:
@@ -42,7 +121,17 @@ def prepare_context(state: OrbixState) -> OrbixState:
     """
     session_id = state["session_id"]
     user_query = state["user_query"]
-    
+
+    # Ensure the SQLite session row exists before any node writes a message.
+    # travel_node / action_node call add_message() directly, and messages has a
+    # FOREIGN KEY to sessions(id) — a client-supplied session_id that was never
+    # registered via start_session() would otherwise crash the write (and the
+    # node's except block would discard an already-computed result).
+    try:
+        start_session(session_id)
+    except Exception as e:
+        logger.error(f"Failed to ensure session {session_id}: {e}")
+
     try:
         # Tier 1: Fetch SQLite transcript (recent messages for context)
         transcript = get_messages(session_id, limit=20)
@@ -97,59 +186,52 @@ def prepare_context(state: OrbixState) -> OrbixState:
     return state
 
 
-def chat_node(state: OrbixState) -> OrbixState:
+async def chat_node(state: OrbixState) -> OrbixState:
     """
     General chat module — integrates with agent.py's run_turn().
-    
-    Phase 2: Call the real agent loop with MCP tools.
-    - Run agent_loop via run_turn() to get intelligent responses
-    - Capture response and enqueue extraction tasks
+
+    Calls the real memory-aware agent loop (MCP tools + Neo4j recall). This is an
+    async node so we can simply await run_turn() instead of nesting event loops.
     """
     session_id = state["session_id"]
     user_query = state["user_query"]
-    
+
     try:
+        _emit(state, "Thinking…")
         logger.info(f"Chat node: calling agent.run_turn() for '{user_query[:50]}...'")
-        
-        # Import here to avoid circular imports
+
         from mcp_host.agent import run_turn
-        
-        # run_turn() is async, so we need to run it in the event loop
-        # Since LangGraph nodes are sync, we use asyncio.run() or nest the call
-        import asyncio
-        try:
-            # Try to get existing loop for nested async contexts
-            loop = asyncio.get_running_loop()
-            # If we get here, we're already in async context - create task
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                result = executor.submit(asyncio.run, run_turn(user_query, session_id)).result()
-        except RuntimeError:
-            # No running loop - safe to use asyncio.run
-            result = asyncio.run(run_turn(user_query, session_id))
-        
+
+        # Stream the agent's tool steps into the thinking bubble as they happen.
+        # run_turn awaits on_event, so it must be a coroutine.
+        async def _on_event(ev):
+            step = ev.get("step") if isinstance(ev, dict) else None
+            if step:
+                _emit(state, step)
+
+        result = await run_turn(user_query, session_id=session_id, on_event=_on_event)
+
         response = result.get("reply", "I couldn't generate a response")
         trace = result.get("trace", [])
-        
+        # run_turn may mint a session_id when none was supplied — keep it
+        state["session_id"] = result.get("session_id", session_id)
+
         state["module_output"] = {
             "response": response,
             "module": "chat",
             "data": {"agent_response": response, "trace_steps": len(trace)}
         }
-        
-        # Save to SQLite (working_memory already saved by agent)
-        add_message(session_id, "assistant", response)
-        
-        # Enqueue extraction from the response (Phase 3 background task)
+
+        # Enqueue extraction from the response (agent already persists the turn)
         state["extraction_tasks"].append({
             "type": "extract_from_turn",
             "user_text": user_query,
             "assistant_text": response,
-            "session_id": session_id,
+            "session_id": state["session_id"],
         })
-        
+
         logger.info(f"Chat node completed successfully with {len(trace)} tool steps")
-        
+
     except Exception as e:
         logger.error(f"Chat node error: {e}", exc_info=True)
         state["module_output"] = {
@@ -167,52 +249,72 @@ def chat_node(state: OrbixState) -> OrbixState:
     return state
 
 
-def travel_node(state: OrbixState) -> OrbixState:
+async def travel_node(state: OrbixState) -> OrbixState:
     """
     Travel planner module — integrates with travel_planner.py.
-    
-    Phase 2: Call the real travel planner pipeline.
-    - Extract travel parameters from query
-    - Call plan_trip() to fetch flights, hotels, attractions, itinerary
-    - Return structured itinerary
-    - Enqueue for Neo4j storage
+
+    Async node: awaits the real plan_trip() pipeline (MCP travel server → Amadeus
+    flights/hotels, OSM attractions, LLM itinerary), then produces a rich reply
+    plus calendar events + todos for the frontend to auto-sync.
     """
     session_id = state["session_id"]
     user_query = state["user_query"]
-    
+
     try:
         logger.info(f"Travel node: planning trip for '{user_query[:50]}...'")
-        
+        _emit(state, "Planning your trip…")
+
         from google_service.travel_planner import plan_trip
-        
-        # plan_trip() takes a query and optional emit callback for progress
-        # Returns dict with entities, flights, hotels, attractions, itinerary, error (if any)
+
         def emit_progress(msg):
-            logger.info(f"Travel progress: {msg}")
-        
-        result = plan_trip(query=user_query, emit=emit_progress)
-        
+            _emit(state, msg)
+
+        # plan_trip is a coroutine — await it directly on the event loop.
+        result = await plan_trip(query=user_query, emit=emit_progress)
+
         # Check for errors in the result
         if "error" in result:
             raise ValueError(result["error"])
-        
+
         # Format response for user
         entities = result.get("entities", {})
         itinerary = result.get("itinerary", "")
         flights = result.get("flights", [])
         hotels = result.get("hotels", [])
         attractions = result.get("attractions", [])
-        
-        to_city = entities.get("to_city", "Unknown")
-        
-        response = f"I've planned a trip to {to_city} for you!\n\n{itinerary}"
+
+        to_city = entities.get("to_city", "your destination")
+
+        parts = [f"## Travel Plan for {to_city}\n"]
         if flights:
-            response += f"\n\n**Flights:** Found {len(flights)} option(s)"
+            f = flights[0]
+            parts.append(
+                "**✈ Best Flight:** "
+                f"{f.get('currency','')} {f.get('price','')} | "
+                f"{f.get('departure','')}→{f.get('arrival','')} | {f.get('duration','')}"
+            )
         if hotels:
-            response += f"\n**Hotels:** Found {len(hotels)} option(s)"
+            h = hotels[0]
+            parts.append(
+                f"**🏨 Top Hotel:** {h.get('name','')} — "
+                f"{h.get('currency','')} {h.get('price','')}/night"
+            )
         if attractions:
-            response += f"\n**Attractions:** {len(attractions)} places to visit"
-        
+            top = ", ".join(a.get("name", "") for a in attractions[:5])
+            parts.append(f"**📍 Top Attractions:** {top}")
+        parts.append("\n### Itinerary\n" + itinerary)
+        response = "\n\n".join(parts)
+
+        # Persist itinerary as calendar events + surface them for frontend sync
+        try:
+            from calendar_store import bulk_create_events
+            ev_defs = _travel_calendar_events(itinerary, to_city, entities.get("check_in"))
+            state["calendar_events"] = bulk_create_events(ev_defs)
+        except Exception as e:
+            logger.error(f"Travel calendar creation failed: {e}")
+            state["calendar_events"] = []
+        state["todo_items"] = [{"text": f"Plan trip to {to_city}", "source": "ai_travel"}]
+
         state["module_output"] = {
             "response": response,
             "module": "travel",
@@ -224,11 +326,11 @@ def travel_node(state: OrbixState) -> OrbixState:
                 "itinerary": itinerary
             }
         }
-        
+
         # Save messages to SQLite
         add_message(session_id, "user", user_query)
         add_message(session_id, "assistant", response)
-        
+
         # Enqueue for Neo4j storage (Phase 3)
         state["extraction_tasks"].append({
             "type": "extract_trip_to_neo4j",
@@ -265,147 +367,141 @@ def travel_node(state: OrbixState) -> OrbixState:
 
 def action_node(state: OrbixState) -> OrbixState:
     """
-    Action executor module — handles send_email, create_meeting, get_emails, etc.
-    
-    Phase 2: Call the real workflow executor with intent classification.
-    - Uses intent_classifier to extract parameters (from LLM)
-    - Calls appropriate service (gmail, calendar, etc.)
-    - Handles errors with retry queueing
+    Action executor module — handles send_email, create_meeting, meeting_and_email,
+    schedule_meeting and get_emails.
+
+    Reuses the classification already produced by route_query (no second LLM call).
+    Mirrors the proven legacy /chat pipeline: creates a real Google Meet link,
+    sends the invite email, records a calendar event + todo, and surfaces those to
+    the frontend via state["calendar_events"] / state["todo_items"].
     """
+    from datetime import datetime
     session_id = state["session_id"]
     user_query = state["user_query"]
     intent = state.get("intent", "unknown")
-    
+
     try:
         logger.info(f"Action node: executing {intent} for '{user_query[:50]}...'")
-        
-        from intent_workflow.intent_classifier import IntentClassifier
-        from google_service.gmail_client import GmailClient
+
         from google_service.mail_generator import MailGenerator
         import calendar_store
-        
-        # Classify and extract parameters
-        classification = IntentClassifier.classify(user_query)
+
+        # Reuse routing's classification; only re-classify if it's missing.
+        classification = state.get("classification") or {}
+        if not classification:
+            from intent_workflow.intent_classifier import IntentClassifier
+            classification = IntentClassifier.classify(user_query) or {}
+
         extracted_intent = classification.get("intent", intent)
-        parameters = classification.get("parameters", {})
-        
+        parameters = classification.get("parameters", {}) or {}
+        email_content = classification.get("email_content", {}) or {}
+
+        # Cross-fill recipient / attendee
+        recipient = parameters.get("recipient_email") or parameters.get("attendee_email")
+
         response = None
         action_data = {}
-        
-        # Execute based on extracted intent
-        if extracted_intent == "send_email":
-            gmail = GmailClient()
-            recipient_email = parameters.get("recipient_email")
-            if not recipient_email:
-                raise ValueError("Recipient email is required to send an email")
-            
-            recipient_name = parameters.get("recipient_name", recipient_email)
-            
-            # Use pre-generated content from classifier if available
-            email_content = classification.get("email_content", {})
-            if not email_content.get("subject") or not email_content.get("body"):
-                # Fall back to mail_generator if not available
-                email_content = MailGenerator.generate_mail_content(
-                    user_prompt=user_query,
-                    recipient_name=recipient_name,
-                    prefilled=email_content
+        calendar_events = []
+        todo_items = []
+
+        gmail = _get_gmail_client()
+
+        # ── get_emails ──────────────────────────────────────────────────────
+        if extracted_intent == "get_emails":
+            if not gmail:
+                raise ValueError("Gmail isn't connected. Please sign in first.")
+            _emit(state, "Fetching your emails…")
+            max_results = int(parameters.get("max_results", 10))
+            emails = gmail.get_latest_emails(max_results)
+            response = f"Fetched {len(emails)} email(s)."
+            action_data = {"emails_retrieved": True, "count": len(emails), "emails": emails}
+
+        # ── email / meeting intents ─────────────────────────────────────────
+        elif extracted_intent in ("send_email", "meeting_and_email",
+                                   "create_meeting", "schedule_meeting"):
+            if not recipient and extracted_intent != "create_meeting":
+                raise ValueError("Please mention the recipient's email address.")
+            if not gmail:
+                raise ValueError("Gmail isn't connected. Please sign in first.")
+
+            meet_link = None
+            event_title = parameters.get("event_title", "Meeting")
+            parts = []
+
+            # Step A: create a Google Meet for meeting-type intents
+            if extracted_intent in ("meeting_and_email", "create_meeting", "schedule_meeting"):
+                _emit(state, "Creating Google Meet…")
+                try:
+                    meet_result = gmail.create_google_meet(
+                        event_title,
+                        parameters.get("event_description", ""),
+                        recipient or "",
+                    )
+                    if meet_result.get("success"):
+                        meet_link = meet_result.get("meet_link")
+                        parts.append(f"**Google Meet created:** {meet_link}")
+                    else:
+                        parts.append(f"Meet creation failed: {meet_result.get('error', 'unknown')}")
+                except Exception as e:
+                    parts.append(f"Meet creation failed: {e}")
+
+            # Step B: send the email (skip for pure create_meeting)
+            if extracted_intent != "create_meeting":
+                _emit(state, f"Sending email to {recipient}…")
+                if not email_content.get("subject") or not email_content.get("body"):
+                    email_content = MailGenerator.generate_mail_content(
+                        user_prompt=parameters.get("event_description", "") or user_query,
+                        recipient_name=parameters.get("recipient_name", recipient.split("@")[0]),
+                        meeting_link=meet_link,
+                        prefilled=email_content,
+                    )
+                body = email_content.get("body", "")
+                if meet_link and meet_link not in body:
+                    body += f"\n\nGoogle Meet Link: {meet_link}"
+                send_result = gmail.send_email(recipient, email_content.get("subject", ""), body)
+                if send_result.get("success"):
+                    subj = email_content.get("subject", "")
+                    parts.append(f"**Email sent** to {recipient}"
+                                 + (f"\n**Subject:** {subj}" if subj else ""))
+                    action_data["email_sent"] = True
+                    action_data["recipient"] = recipient
+                else:
+                    parts.append(f"Email to {recipient} failed: {send_result.get('error', 'unknown')}")
+
+            # Step C: record a calendar event for the meeting
+            if extracted_intent in ("meeting_and_email", "create_meeting", "schedule_meeting"):
+                meeting_date = (parameters.get("start_time") or "")[:10] or datetime.utcnow().strftime("%Y-%m-%d")
+                meeting_time = (parameters.get("start_time") or "")[11:16]
+                ev = calendar_store.create_event(
+                    title=event_title,
+                    date=meeting_date,
+                    time=meeting_time,
+                    description=f"Attendee: {recipient or 'N/A'}\nMeet link: {meet_link or 'N/A'}",
+                    type="meeting",
+                    source="ai_meeting",
                 )
-            
-            # Send the email
-            result = gmail.send_email(
-                to=recipient_email,
-                subject=email_content.get("subject", ""),
-                body=email_content.get("body", "")
-            )
-            
-            response = f"Email sent successfully to {recipient_email}!"
-            action_data = {"email_sent": True, "recipient": recipient_email}
-            
-        elif extracted_intent == "create_meeting":
-            event_title = parameters.get("event_title")
-            if not event_title:
-                raise ValueError("Event title is required to create a meeting")
-            
-            # Create calendar event
-            event = calendar_store.create_event(
-                title=event_title,
-                date=parameters.get("date", ""),
-                time=parameters.get("time", ""),
-                description=parameters.get("event_description", ""),
-                type="meeting"
-            )
-            
-            response = f"Meeting '{event_title}' created successfully!"
-            action_data = {"event_created": True, "event_id": event.get("id")}
-            
-        elif extracted_intent == "meeting_and_email":
-            gmail = GmailClient()
-            event_title = parameters.get("event_title")
-            attendee_email = parameters.get("attendee_email")
-            
-            if not event_title or not attendee_email:
-                raise ValueError("Event title and attendee email are required")
-            
-            # Step 1: Create meeting
-            event = calendar_store.create_event(
-                title=event_title,
-                date=parameters.get("date", ""),
-                time=parameters.get("time", ""),
-                description=parameters.get("event_description", ""),
-                type="meeting"
-            )
-            
-            # Step 2: Generate and send invitation email
-            email_content = classification.get("email_content", {})
-            if not email_content.get("subject") or not email_content.get("body"):
-                email_content = MailGenerator.generate_mail_content(
-                    user_prompt=user_query,
-                    recipient_name=attendee_email,
-                    prefilled=email_content
-                )
-            
-            gmail.send_email(
-                to=attendee_email,
-                subject=email_content.get("subject", ""),
-                body=email_content.get("body", "")
-            )
-            
-            response = f"Meeting created and invitation sent to {attendee_email}!"
-            action_data = {"event_created": True, "email_sent": True, "event_id": event.get("id")}
-            
-        elif extracted_intent == "get_emails":
-            gmail = GmailClient()
-            max_results = int(parameters.get("max_results", 5))
-            
-            # Fetch recent emails
-            emails = gmail.get_emails(max_results=max_results)
-            
-            # Format for user
-            if emails:
-                email_list = "\n".join([
-                    f"- From: {e.get('from')}, Subject: {e.get('subject')}"
-                    for e in emails
-                ])
-                response = f"Here are your {len(emails)} recent emails:\n{email_list}"
-            else:
-                response = "You don't have any recent emails."
-            
-            action_data = {"emails_retrieved": True, "count": len(emails) if emails else 0}
-            
+                calendar_events.append(ev)
+                todo_items.append({"text": f"Prepare for: {event_title}", "source": "ai_meeting"})
+                action_data["event_created"] = True
+
+            response = "\n\n".join(parts) if parts else "Done."
+
         else:
             response = f"I don't recognize the action '{extracted_intent}'. Please try again."
             action_data = {"error": f"Unknown action: {extracted_intent}"}
-        
+
         state["module_output"] = {
             "response": response,
             "module": "action",
-            "data": action_data
+            "data": action_data,
         }
-        
+        state["calendar_events"] = calendar_events
+        state["todo_items"] = todo_items
+
         # Save messages to SQLite
         add_message(session_id, "user", user_query)
         add_message(session_id, "assistant", response)
-        
+
         # Enqueue for extraction (Phase 3)
         state["extraction_tasks"].append({
             "type": "extract_action",
@@ -413,9 +509,9 @@ def action_node(state: OrbixState) -> OrbixState:
             "parameters": parameters,
             "session_id": session_id,
         })
-        
+
         logger.info(f"Action node completed: {extracted_intent}")
-        
+
     except Exception as e:
         logger.error(f"Action node error: {e}", exc_info=True)
         state["module_output"] = {
@@ -650,14 +746,14 @@ async def run_workflow(user_query: str, session_id: str) -> OrbixState:
     """
     workflow = get_workflow()
     initial_state = new_state(user_query, session_id)
-    
+
     logger.info(f"Starting workflow for session {session_id}")
-    
-    # Run synchronously (LangGraph handles async internally if needed)
-    final_state = workflow.invoke(
+
+    # Async invoke — chat_node / travel_node are async coroutine nodes.
+    final_state = await workflow.ainvoke(
         initial_state,
         config={"recursion_limit": 50}
     )
-    
+
     logger.info(f"Workflow completed for session {session_id}")
     return final_state

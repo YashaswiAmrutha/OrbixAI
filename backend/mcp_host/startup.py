@@ -1,13 +1,14 @@
 """
 App startup orchestration for OrbixAI.
 
-On launch we must guarantee the pieces the agent + extractor depend on:
+On launch we must guarantee the pieces the agent depends on:
   1. Ollama is serving        -> if not, launch `ollama serve` detached and wait.
   2. Working memory is ready   -> init the SQLite schema.
-  3. Leftover writes are drained -> any turns left `pending` because the app was
-     closed right after a reply get extracted into Neo4j now (drain-on-startup).
-  4. Neo4j status is reported  -> we can't auto-start Neo4j Desktop; we log clearly
-     if it's down (queued turns simply wait and drain on a later start).
+  3. Neo4j status is reported  -> we can't auto-start Neo4j Desktop; we log clearly
+     if it's down.
+
+(Drain-on-startup was removed with the old SQLite-queue write pathway; durable memory
+writes now happen per turn via the LangGraph background write path.)
 
 Called from FastAPI's lifespan in main.py. Safe to call more than once.
 """
@@ -81,13 +82,9 @@ def run_startup() -> dict:
     wm.init_db()
     report["neo4j"] = neo4j_status()
 
-    # drain anything left pending from a previous run (only if Neo4j is up)
-    if report["neo4j"]:
-        import extractor  # type: ignore
-        report["drain"] = extractor.drain_all()
-    else:
-        report["drain"] = {"skipped": "neo4j_unreachable",
-                           "pending": wm.pending_count()}
+    # NOTE: drain-on-startup has been removed along with the old SQLite-queue write
+    # pathway. Durable memory writes now happen through the LangGraph background write
+    # path (orchestration.extraction_executor) per turn, not via a startup queue drain.
     logger.info("Startup report: %s", report)
     return report
 

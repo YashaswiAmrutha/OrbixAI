@@ -10,6 +10,138 @@
       "source": "manual",
       "color": "#3b82f6",
       "created_at": "2026-06-19T12:26:22.202627"
+    },
+    {
+      "id": "57d8fb60-6930-4bbb-8198-1f8b550c99f2",
+      "title": "Day 1: Historical Sites and Beach Time**",
+      "date": "2026-01-27",
+      "time": "",
+      "description": "Trip to Goa",
+      "type": "travel",
+      "source": "ai_travel",
+      "color": "#22c55e",
+      "created_at": "2026-07-02T17:44:04.428314"
+    },
+    {
+      "id": "7dd76cff-28d2-4813-bcbe-3958f737f38f",
+      "title": "Day 2: Museums and Waterfalls**",
+      "date": "2026-01-28",
+      "time": "",
+      "description": "Trip to Goa",
+      "type": "travel",
+      "source": "ai_travel",
+      "color": "#22c55e",
+      "created_at": "2026-07-02T17:44:04.438943"
+    },
+    {
+      "id": "f190bbe4-60ec-4a20-83a4-b31f3aa6de3e",
+      "title": "Day 3: Forts and Caves**",
+      "date": "2026-01-29",
+      "time": "",
+      "description": "Trip to Goa",
+      "type": "travel",
+      "source": "ai_travel",
+      "color": "#22c55e",
+      "created_at": "2026-07-02T17:44:04.448885"
+    },
+    {
+      "id": "cb015d33-16bc-4764-afdf-3f81e20d6f0c",
+      "title": "Day 1: Historical Sites and Beach Relaxation**",
+      "date": "2026-07-07",
+      "time": "",
+      "description": "Trip to Goa",
+      "type": "travel",
+      "source": "ai_travel",
+      "color": "#22c55e",
+      "created_at": "2026-07-07T07:05:47.643840"
+    },
+    {
+      "id": "88db0b12-4f95-450b-bd02-c172d96908a0",
+      "title": "Day 2: Forts and Caves**",
+      "date": "2026-07-08",
+      "time": "",
+      "description": "Trip to Goa",
+      "type": "travel",
+      "source": "ai_travel",
+      "color": "#22c55e",
+      "created_at": "2026-07-07T07:05:47.658784"
+    },
+    {
+      "id": "ecee6bff-9420-44b9-a8cb-8920961b52c2",
+      "title": "Day 3: Museums and Waterfalls**",
+      "date": "2026-07-09",
+      "time": "",
+      "description": "Trip to Goa",
+      "type": "travel",
+      "source": "ai_travel",
+      "color": "#22c55e",
+      "created_at": "2026-07-07T07:05:47.669156"
+    },
+    {
+      "id": "a140cfe1-1208-44c5-9510-d52f5b6406f4",
+      "title": "Day 1: July 7th, 2026**",
+      "date": "2026-07-07",
+      "time": "",
+      "description": "Trip to Goa",
+      "type": "travel",
+      "source": "ai_travel",
+      "color": "#22c55e",
+      "created_at": "2026-07-07T07:11:30.487999"
+    },
+    {
+      "id": "f1a7950f-ae2b-4bea-8e61-18ee76474283",
+      "title": "Day 1: Travel Tips:**",
+      "date": "2026-07-07",
+      "time": "",
+      "description": "Trip to Goa",
+      "type": "travel",
+      "source": "ai_travel",
+      "color": "#22c55e",
+      "created_at": "2026-07-07T07:11:30.498679"
+    },
+    {
+      "id": "34aced4d-4199-446d-ab60-f4e287e369e7",
+      "title": "Day 2: July 8th, 2026**",
+      "date": "2026-07-08",
+      "time": "",
+      "description": "Trip to Goa",
+      "type": "travel",
+      "source": "ai_travel",
+      "color": "#22c55e",
+      "created_at": "2026-07-07T07:11:30.508156"
+    },
+    {
+      "id": "8b6c4184-279b-4771-890a-c961de6368c2",
+      "title": "Day 2: Travel Tips:**",
+      "date": "2026-07-08",
+      "time": "",
+      "description": "Trip to Goa",
+      "type": "travel",
+      "source": "ai_travel",
+      "color": "#22c55e",
+      "created_at": "2026-07-07T07:11:30.518378"
+    },
+    {
+      "id": "ad891298-871d-4696-82b1-4fc30decaa59",
+      "title": "Day 3: July 9th, 2026**",
+      "date": "2026-07-09",
+      "time": "",
+      "description": "Trip to Goa",
+      "type": "travel",
+      "source": "ai_travel",
+      "color": "#22c55e",
+      "created_at": "2026-07-07T07:11:30.527975"
+    },
+    {
+      "id": "6138bdad-8f2c-4d87-a0c8-98af1764987c",
+      "title": "Day 3: Travel Tips:**",
+      "date": "2026-07-09",
+      "time": "",
+      "description": "Trip to Goa",
+      "type": "travel",
+      "source": "ai_travel",
+      "color": "#22c55e",
+      "created_at": "2026-07-07T07:11:30.538978"
     }
   ]
 }

@@ -321,12 +321,28 @@ out center tags;
 # 5. ITINERARY GENERATION  (LLM)
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _fallback_itinerary(city: str, attractions: List[Dict], num_days: int) -> str:
+    """Deterministic day-by-day plan from the attractions list (never empty).
+    Uses the 'Day N:' format so the calendar parser can turn it into events."""
+    num_days = max(1, int(num_days or 1))
+    names = [a.get("name") for a in attractions if a.get("name")] or [f"Explore {city}"]
+    per_day = max(1, -(-len(names) // num_days))  # ceil
+    lines = [f"# {num_days}-Day Trip to {city}", ""]
+    idx = 0
+    for d in range(1, num_days + 1):
+        chunk = names[idx:idx + per_day] or [f"Free time in {city}"]
+        idx += per_day
+        lines.append(f"Day {d}: " + ", ".join(chunk[:3]))
+        for spot in chunk:
+            lines.append(f"  - Visit {spot}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
 def generate_itinerary(city: str, attractions: List[Dict], num_days: int,
                        check_in: str, num_adults: int = 1,
                        flight_summary: str = None,
                        hotel_summary: str = None) -> str:
-    from llm.ollama_client import generate_response
-
     attractions_text = "\n".join(
         f"- {a['name']} ({a['category']})"
         for a in attractions[:15]
@@ -350,8 +366,22 @@ def generate_itinerary(city: str, attractions: List[Dict], num_days: int,
         "ITINERARY:"
     )
 
+    # Use an instruction-following model for prose (NOT the fine-tuned orchestrator,
+    # which emits tool-calls). Always return a non-empty string — an empty return
+    # would break the MCP itinerary round-trip.
     try:
-        return generate_response(prompt)
+        import ollama
+        model = os.environ.get("ORBIX_TRAVEL_MODEL", "llama3.1:8b")
+        resp = ollama.chat(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": 0.6, "num_predict": 900,
+                     "num_gpu": int(os.environ.get("OLLAMA_NUM_GPU", "0"))},
+        )
+        text = (resp.get("message", {}).get("content") or "").strip()
+        if text:
+            return text
+        logger.warning("[Travel] LLM returned empty itinerary; using deterministic fallback")
     except Exception as e:
-        logger.error("[Travel] Itinerary generation failed: %s", e)
-        return f"Could not generate itinerary: {e}"
+        logger.error("[Travel] Itinerary generation failed: %s; using fallback", e)
+    return _fallback_itinerary(city, attractions, num_days)

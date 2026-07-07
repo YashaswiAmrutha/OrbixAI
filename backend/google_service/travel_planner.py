@@ -79,58 +79,61 @@ def _validate_date(s: Optional[str]) -> Optional[str]:
         return None
 
 
+# JSON schema constraining the extractor's output (Ollama structured output).
+_TRAVEL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "from_city":  {"type": "string"},
+        "to_city":    {"type": "string"},
+        "check_in":   {"type": "string"},
+        "check_out":  {"type": "string"},
+        "num_nights": {"type": "integer"},
+        "num_adults": {"type": "integer"},
+    },
+    "required": ["to_city"],
+}
+
+
 def extract_travel_entities(query: str, emit=None) -> Dict:
-    """Extract travel details using gpraneeth555/llama-3-13k (HF) or Ollama."""
-    import re
+    """
+    Extract travel details as strict JSON via Ollama structured output.
+
+    Uses an instruction-following model (llama3.1:8b by default) with a JSON schema —
+    the same reliable pattern the memory extractor uses. The fine-tuned orchestrator
+    model is NOT used here: it emits tool-call plans, not extraction JSON.
+    """
+    import ollama
 
     def _emit(msg):
         if emit:
             emit(msg)
 
-    # ── Try HuggingFace model first ──────────────────────────────────────────
-    raw = None
+    _emit("Extracting travel details…")
+    model = os.environ.get("ORBIX_TRAVEL_MODEL", "llama3.1:8b")
     try:
-        from llm.hf_client import call_hf_model
-        _emit("Extracting travel details with llama-3-13k…")
-        prompt_text = EXTRACTION_PROMPT + query + "\nJSON:"
-        raw = call_hf_model(prompt_text, max_new_tokens=256)
-        logger.info("[Travel] HF extraction raw: %s", raw[:200] if raw else "empty")
+        resp = ollama.chat(
+            model=model,
+            messages=[
+                {"role": "system", "content": EXTRACTION_PROMPT.rstrip().rstrip("Query:").rstrip()},
+                {"role": "user", "content": query},
+            ],
+            format=_TRAVEL_SCHEMA,
+            options={"temperature": 0, "num_gpu": int(os.environ.get("OLLAMA_NUM_GPU", "0"))},
+        )
+        data = json.loads(resp["message"]["content"])
+        logger.info("[Travel] extracted entities: %s", data)
     except Exception as e:
-        logger.warning("[Travel] HF extraction failed (%s), falling back to Ollama", e)
-
-    # ── Ollama fallback ──────────────────────────────────────────────────────
-    if not raw:
-        try:
-            
-            
-
-            _emit("Extracting travel details with Ollama...")
-
-            raw = generate_response(
-                EXTRACTION_PROMPT + query + "\nJSON:"
-            )
-        except Exception as e:
-            logger.error("[Travel] Ollama extraction also failed: %s", e)
-            return _empty_entities()
-
-    # ── Parse JSON ────────────────────────────────────────────────────────────
-    try:
-        raw_clean = re.sub(r"```(?:json)?", "", raw).strip().rstrip("```").strip()
-        match = re.search(r"\{[\s\S]*\}", raw_clean)
-        if not match:
-            raise ValueError("No JSON found in extraction output")
-        data = json.loads(match.group())
-        return {
-            "from_city":  data.get("from_city", "").strip().title() if data.get("from_city") else None,
-            "to_city":    data.get("to_city", "").strip().title() if data.get("to_city") else None,
-            "check_in":   _validate_date(data.get("check_in")),
-            "check_out":  _validate_date(data.get("check_out")),
-            "num_nights": data.get("num_nights") if isinstance(data.get("num_nights"), int) else None,
-            "num_adults": data.get("num_adults") if isinstance(data.get("num_adults"), int) else 1,
-        }
-    except Exception as e:
-        logger.error("[Travel] Entity parse error: %s | raw: %s", e, raw[:300])
+        logger.error("[Travel] entity extraction failed: %s", e)
         return _empty_entities()
+
+    return {
+        "from_city":  (data.get("from_city") or "").strip().title() or None,
+        "to_city":    (data.get("to_city") or "").strip().title() or None,
+        "check_in":   _validate_date(data.get("check_in")),
+        "check_out":  _validate_date(data.get("check_out")),
+        "num_nights": data.get("num_nights") if isinstance(data.get("num_nights"), int) else None,
+        "num_adults": data.get("num_adults") if isinstance(data.get("num_adults"), int) else 1,
+    }
 
 
 def _empty_entities():
@@ -202,9 +205,14 @@ async def plan_trip(query: str, emit: Callable[[str], None] = None) -> Dict:
             emit(msg)
         logger.info("[Travel] %s", msg)
 
+    # Resolve the MCP travel server path relative to this file so it works on any
+    # machine/OS (was previously hardcoded to a teammate's macOS Downloads folder).
+    _backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _server_script = os.path.join(_backend_dir, "mcp_travel_server.py")
     server_params = StdioServerParameters(
         command=sys.executable,
-        args=["/Users/nryashaswiamrutha/Downloads/OrbixAI-main copy/backend/mcp_travel_server.py"]
+        args=[_server_script],
+        cwd=_backend_dir,  # so the subprocess can import google_service.* / mcp_travel_client
     )
 
     async with stdio_client(server_params) as (read_stream, write_stream):
@@ -370,22 +378,36 @@ async def plan_trip(query: str, emit: Callable[[str], None] = None) -> Dict:
             else:
                 _emit("Attractions retrieved")
 
-            # Step 5: Itinerary
+            # Step 5: Itinerary (via MCP; falls back to an in-process build if MCP
+            # returns nothing, so a demo never ends up with an empty itinerary).
             _emit(f"Generating {num_nights}-day itinerary...")
 
-            itinerary = await generate_itinerary_mcp(
-                session=session,
-                city=to_city,
-                attractions=attractions,
-                num_days=num_nights,
-                check_in=check_in or datetime.now().strftime("%Y-%m-%d"),
-                num_adults=num_adults,
-                flight_summary=flight_summary,
-                hotel_summary=hotel_summary
-            )
+            itinerary = ""
+            try:
+                itinerary = await generate_itinerary_mcp(
+                    session=session,
+                    city=to_city,
+                    attractions=attractions,
+                    num_days=num_nights,
+                    check_in=check_in or datetime.now().strftime("%Y-%m-%d"),
+                    num_adults=num_adults,
+                    flight_summary=flight_summary,
+                    hotel_summary=hotel_summary
+                )
+            except Exception as e:
+                logger.error("[Travel] MCP itinerary failed: %s", e)
 
-            print("ITINERARY TYPE:", type(itinerary))
-            print("ITINERARY DATA:", itinerary)
+            _it_str = str(itinerary or "").strip()
+            if (not _it_str) or _it_str.lower().startswith("error executing tool") \
+                    or "validation error" in _it_str.lower():
+                logger.warning("[Travel] Bad/empty MCP itinerary — building in-process fallback")
+                from google_service.travel_services import generate_itinerary as _gi
+                itinerary = _gi(
+                    city=to_city, attractions=attractions, num_days=num_nights,
+                    check_in=check_in or datetime.now().strftime("%Y-%m-%d"),
+                    num_adults=num_adults,
+                    flight_summary=flight_summary, hotel_summary=hotel_summary,
+                )
 
             result["itinerary"] = itinerary
 

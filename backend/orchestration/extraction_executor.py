@@ -73,43 +73,36 @@ class ExtractionExecutor:
 
     async def _extract_from_turn(self, task: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Extract facts from conversation turn (user + assistant).
-        Identifies entities, relationships, and preferences.
+        Extract durable facts from the user's turn and persist them to Neo4j.
+
+        This is now the single write path for chat memory (the old flush-barrier /
+        SQLite-queue drain has been removed). It reuses the proven extraction engine
+        (heuristic gate -> structured-output LLM -> resolve/reconcile/upsert) so writes
+        land in the same :Entity/:Fact/:Memory graph the agent reads via recall().
+
+        Only the user's turn is mined (matching the original design — the assistant's
+        text is not treated as a source of durable facts).
         """
         try:
             user_text = task.get("user_text", "")
-            assistant_text = task.get("assistant_text", "")
             session_id = task.get("session_id")
 
-            logger.info(f"Extracting facts from turn (session {session_id})")
+            from mcp_host import extractor
 
-            # Async extraction logic
-            from graph.memory import extract_entities_from_text
-            
-            # Extract entities from both user and assistant messages
-            user_entities = await asyncio.to_thread(
-                extract_entities_from_text,
-                user_text,
-                session_id
-            )
-            
-            assistant_entities = await asyncio.to_thread(
-                extract_entities_from_text,
-                assistant_text,
-                session_id
-            )
+            def _run() -> int:
+                # Cheap gate first; skip questions/greetings/chit-chat without an LLM call.
+                if not extractor.is_memory_worthy(user_text):
+                    return 0
+                result = extractor.extract(user_text)          # structured-output LLM
+                return extractor._persist(result, source="langgraph")  # -> Neo4j (idempotent MERGE)
 
-            combined_entities = {
-                "user_mentions": user_entities.get("entities", []),
-                "assistant_mentions": assistant_entities.get("entities", []),
-                "relationships": user_entities.get("relationships", []),
-            }
-
-            logger.info(f"Extracted {len(combined_entities.get('user_mentions', []))} entities from turn")
-
-            return {"success": True, "extracted": combined_entities}
+            writes = await asyncio.to_thread(_run)
+            logger.info(f"extract_from_turn: {writes} write(s) to Neo4j (session {session_id})")
+            return {"success": True, "writes": writes}
 
         except Exception as e:
+            # Fire-and-forget: on failure (e.g. Neo4j down) the fact is lost — there is no
+            # durable retry queue anymore. Logged so it's visible.
             logger.error(f"Error in _extract_from_turn: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 

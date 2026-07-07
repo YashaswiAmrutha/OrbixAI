@@ -63,15 +63,6 @@ async def lifespan(app: FastAPI):
     yield
 
 
-def _drain_session_bg(session_id: str):
-    """Post-reply background extraction so Neo4j stays fresh (runs off the response)."""
-    try:
-        from mcp_host import extractor
-        extractor.drain(session_id=session_id)
-    except Exception as e:
-        logger.error("post-reply drain failed: %s", e)
-
-
 def _cleanup_expired_messages_bg():
     """Daily cleanup: delete expired SQLite messages (24hr lifespan)."""
     try:
@@ -456,26 +447,73 @@ async def workflow_chat(message: dict):
     logger.info(f"[LangGraph] Starting workflow for session {session_id}")
     
     async def generate():
-        """Stream SSE events from workflow execution."""
+        """Stream SSE events from LangGraph workflow execution."""
+        from orchestration.workflow import (
+            register_progress_emitter, unregister_progress_emitter,
+        )
+        loop = asyncio.get_event_loop()
+        step_queue: asyncio.Queue = asyncio.Queue()
+
+        def _emit_step(step: str):
+            # Called (synchronously) from inside workflow nodes — hand the step to
+            # the SSE generator via the event loop.
+            try:
+                loop.call_soon_threadsafe(
+                    step_queue.put_nowait, {"type": "thinking", "step": step}
+                )
+            except Exception:
+                pass
+
+        register_progress_emitter(session_id, _emit_step)
         try:
-            yield f'data: {json.dumps({"type": "thinking", "step": "Starting workflow..."})}\n\n'
-            
-            # Run the LangGraph workflow
-            final_state = await run_workflow(user_message, session_id)
-            
-            # Extract response from final state
-            response = final_state.get("module_output", {}).get("formatted", "No response")
-            module = final_state.get("module_output", {}).get("module", "unknown")
-            
-            logger.info(f"[LangGraph] Workflow completed: module={module}")
-            
-            yield f'data: {json.dumps({"type": "response", "reply": response, "module": module, "session_id": session_id})}\n\n'
-            
+            yield f'data: {json.dumps({"type": "thinking", "step": "Understanding your request…"})}\n\n'
+
+            # Run the workflow while draining progress steps concurrently
+            task = asyncio.ensure_future(run_workflow(user_message, session_id))
+            while not (task.done() and step_queue.empty()):
+                try:
+                    ev = await asyncio.wait_for(step_queue.get(), timeout=0.2)
+                    yield f'data: {json.dumps(ev)}\n\n'
+                except asyncio.TimeoutError:
+                    continue
+
+            final_state = await task
+
+            mo = final_state.get("module_output", {}) or {}
+            reply = mo.get("formatted") or mo.get("response") or "No response"
+            module = mo.get("module", "unknown")
+            intent = final_state.get("intent")
+            sid = final_state.get("session_id", session_id)
+
+            payload = {
+                "type": "response",
+                "reply": reply,
+                "module": module,
+                "intent": intent,
+                "session_id": sid,
+            }
+            cal = final_state.get("calendar_events") or []
+            todos = final_state.get("todo_items") or []
+            if cal:
+                payload["calendar_events"] = cal
+            if todos:
+                payload["todo_items"] = todos
+            emails = (mo.get("data") or {}).get("emails")
+            if emails:
+                payload["emails"] = emails
+
+            logger.info(f"[LangGraph] Workflow completed: module={module}, intent={intent}")
+            yield f'data: {json.dumps(payload)}\n\n'
+
         except Exception as e:
             logger.error(f"Workflow error: {e}", exc_info=True)
             yield f'data: {json.dumps({"type": "error", "message": str(e)})}\n\n'
-    
-    return StreamingResponse(generate(), media_type="text/event-stream")
+        finally:
+            unregister_progress_emitter(session_id)
+
+    return StreamingResponse(generate(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
 
 
 @app.post("/workflow/cleanup")
@@ -706,8 +744,8 @@ async def chat_stream(message: dict):
                     except asyncio.TimeoutError:
                         continue
                 out = await agent_task
-                # remember-after: extract this turn into Neo4j off the response path
-                asyncio.create_task(asyncio.to_thread(_drain_session_bg, out["session_id"]))
+                # Durable memory writes now happen via the LangGraph background write
+                # path (this legacy fallback no longer drains to Neo4j itself).
                 yield _sse({"type": "response", "reply": out["reply"],
                             "intent": "general_chat", "session_id": out["session_id"]})
                 return
@@ -724,9 +762,10 @@ async def chat_stream(message: dict):
                     )
 
                 async def _run_plan():
-                    result = await loop.run_in_executor(
-                        None, lambda: plan_trip(user_text, emit=_emit)
-                    )
+                    # plan_trip is a coroutine (spawns an MCP travel server over stdio),
+                    # so await it directly on the event loop instead of run_in_executor
+                    # (which would return an un-awaited coroutine).
+                    result = await plan_trip(user_text, emit=_emit)
                     await step_queue.put(None)  # sentinel
                     return result
 
@@ -935,8 +974,8 @@ async def agent_chat(message: dict, background_tasks: BackgroundTasks):
             return {"error": "message is required"}
         session_id = message.get("session_id")
         out = await run_turn(user_text, session_id=session_id)
-        # remember-after: extract this turn into Neo4j once the reply is sent
-        background_tasks.add_task(_drain_session_bg, out["session_id"])
+        # Durable memory writes now go through the LangGraph background write path;
+        # this legacy endpoint no longer drains to Neo4j itself.
         return {
             "reply": out["reply"],
             "session_id": out["session_id"],

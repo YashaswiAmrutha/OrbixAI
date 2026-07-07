@@ -17,3 +17,5 @@ PyYAML
 mcp
 langgraph
 langchain
+amadeus
+google-search-results

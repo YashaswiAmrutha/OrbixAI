@@ -114,11 +114,24 @@ def _conn():
 
 
 def init_db() -> None:
-    """Create the tables/indexes if they don't exist. Idempotent."""
+    """Create the tables/indexes if they don't exist. Idempotent + self-healing."""
     con = sqlite3.connect(DB_PATH, timeout=30)
     try:
         con.execute("PRAGMA journal_mode=WAL;")
-        con.executescript(_SCHEMA)
+        try:
+            con.executescript(_SCHEMA)
+        except sqlite3.OperationalError as e:
+            # Older builds created `messages` without the created_at/expires_at
+            # columns, so the expires index fails ("no such column: expires_at").
+            # Working memory is ephemeral (24h) and SQLite can't ADD COLUMN with a
+            # non-constant DEFAULT, so rebuild the drifted table rather than migrate.
+            logger.warning("Working-memory schema drift (%s); rebuilding messages table", e)
+            con.executescript(
+                "DROP INDEX IF EXISTS idx_messages_expires;"
+                "DROP INDEX IF EXISTS idx_messages_session;"
+                "DROP TABLE IF EXISTS messages;"
+            )
+            con.executescript(_SCHEMA)
         con.commit()
         logger.info("Working memory ready at %s", DB_PATH)
     finally:
