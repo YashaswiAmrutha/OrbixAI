@@ -36,7 +36,7 @@ import memory as mem          # type: ignore  # noqa: E402
 logger = logging.getLogger(__name__)
 
 # Reuse the agent model by default (already pulled); swap for a smaller one later.
-EXTRACT_MODEL = os.environ.get("ORBIX_EXTRACT_MODEL", "llama3.1:8b")
+EXTRACT_MODEL = os.environ.get("ORBIX_EXTRACT_MODEL", "llama3.2:3b")
 _OPTIONS = {"temperature": 0.0, "num_gpu": int(os.environ.get("OLLAMA_NUM_GPU", "0"))}
 
 # JSON schema constraining the extractor's output (Ollama structured output).

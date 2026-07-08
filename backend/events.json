@@ -142,6 +142,72 @@
       "source": "ai_travel",
       "color": "#22c55e",
       "created_at": "2026-07-07T07:11:30.538978"
+    },
+    {
+      "id": "28d09b16-fa18-4fea-8511-64551c4ab8fd",
+      "title": "Dentist Appointment",
+      "date": "2026-07-20",
+      "time": "10:00",
+      "description": "",
+      "type": "meeting",
+      "source": "ai_agent",
+      "color": "#3b82f6",
+      "created_at": "2026-07-07T08:39:35.519240"
+    },
+    {
+      "id": "e1151f03-3eeb-4ab5-a916-97cd0fefa41c",
+      "title": "Team Standup",
+      "date": "2026-07-22",
+      "time": "09:30",
+      "description": "",
+      "type": "general",
+      "source": "ai_agent",
+      "color": "#8b5cf6",
+      "created_at": "2026-07-07T08:55:15.857813"
+    },
+    {
+      "id": "4b85e0db-5148-4b94-a25b-eb8300177e72",
+      "title": "Project Review",
+      "date": "2026-07-25",
+      "time": "15:00",
+      "description": "",
+      "type": "event",
+      "source": "ai_agent",
+      "color": "#8b5cf6",
+      "created_at": "2026-07-07T08:57:06.268019"
+    },
+    {
+      "id": "4d096036-f6d2-45da-a78a-8e7d3d238e86",
+      "title": "Capstone Review",
+      "date": "2026-07-09",
+      "time": "15:00",
+      "description": "",
+      "type": "meeting",
+      "source": "ai_agent",
+      "color": "#3b82f6",
+      "created_at": "2026-07-08T02:09:21.638753"
+    },
+    {
+      "id": "9b2c1af2-88dd-4450-a7d3-bcaec020317d",
+      "title": "Test Event",
+      "date": "2026-07-09",
+      "time": "16:00:00",
+      "description": "",
+      "type": "meeting",
+      "source": "ai_agent",
+      "color": "#3b82f6",
+      "created_at": "2026-07-08T02:26:08.451802"
+    },
+    {
+      "id": "8286dace-17c8-4f6f-81de-acf3a3cdaed0",
+      "title": "Design Review",
+      "date": "2026-07-09",
+      "time": "14:00",
+      "description": "",
+      "type": "general",
+      "source": "ai_agent",
+      "color": "#8b5cf6",
+      "created_at": "2026-07-08T02:52:17.297437"
     }
   ]
 }

@@ -109,7 +109,7 @@ def extract_travel_entities(query: str, emit=None) -> Dict:
             emit(msg)
 
     _emit("Extracting travel details…")
-    model = os.environ.get("ORBIX_TRAVEL_MODEL", "llama3.1:8b")
+    model = os.environ.get("ORBIX_TRAVEL_MODEL", "llama3.2:3b")
     try:
         resp = ollama.chat(
             model=model,

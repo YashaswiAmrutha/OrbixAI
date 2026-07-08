@@ -29,13 +29,19 @@ logger = logging.getLogger(__name__)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _MEMORY_SERVER = _REPO_ROOT / "backend" / "mcp_servers" / "memory_server.py"
+_GSUITE_SERVER = _REPO_ROOT / "backend" / "mcp_servers" / "gsuite_server.py"
 
 # Default server roster. Use the current interpreter + absolute paths so spawning
-# never depends on PATH or the working directory. Add gmail/calendar/web here later.
+# never depends on PATH or the working directory.
 DEFAULT_SERVERS: dict[str, dict] = {
     "orbix-memory": {
         "command": sys.executable,
         "args": [str(_MEMORY_SERVER)],
+    },
+    # Gmail / Google Meet / calendar actions — the agent's "hands".
+    "orbix-gsuite": {
+        "command": sys.executable,
+        "args": [str(_GSUITE_SERVER)],
     },
 }
 
@@ -111,6 +117,11 @@ class MCPClientManager:
                 },
             })
         return out
+
+    def server_of(self, tool_name: str) -> str | None:
+        """Name of the MCP server that owns a tool (or None if unknown)."""
+        entry = self.tool_index.get(tool_name)
+        return entry[0] if entry else None
 
     def is_readonly(self, tool_name: str) -> bool:
         """Whether a tool advertised readOnlyHint (used for write confirm-gating)."""

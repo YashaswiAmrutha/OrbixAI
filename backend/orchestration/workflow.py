@@ -94,17 +94,39 @@ def _travel_calendar_events(itinerary: str, destination: str, departure_date: st
     return events
 
 
-def _get_gmail_client():
-    """Best-effort authenticated Gmail client (None if not authenticated)."""
-    try:
-        from google_service.gmail_client import GmailClient
-        client = GmailClient()
-        if not client.is_authenticated():
-            client._try_load_token()
-        return client if client.is_authenticated() else None
-    except Exception as e:
-        logger.error(f"Gmail client init failed: {e}")
-        return None
+def _calendar_events_from_trace(trace: list) -> tuple[list, list]:
+    """
+    Turn calendar-affecting agent tool calls into (calendar_events, todo_items) so the
+    frontend can auto-sync them — mirrors what action_node/travel_node used to surface.
+
+    - create_calendar_event returns the stored event dict directly → use as-is.
+    - create_meet returns {meet_link, event_id, event_title, attendee_email}; the gsuite
+      tool doesn't add it to the local calendar, so synthesize a `meeting` event here.
+    """
+    from datetime import datetime
+    cal_events, todos = [], []
+    for t in trace or []:
+        name = t.get("tool")
+        res = t.get("result")
+        if not isinstance(res, dict) or res.get("error"):
+            continue
+        if name == "create_calendar_event" and res.get("id"):
+            cal_events.append(res)
+            todos.append({"text": f"Follow up: {res.get('title', 'event')}",
+                          "source": "ai_agent"})
+        elif name == "create_meet" and res.get("meet_link"):
+            title = res.get("event_title", "Meeting")
+            cal_events.append({
+                "title": title,
+                "date": datetime.utcnow().strftime("%Y-%m-%d"),
+                "time": "",
+                "description": (f"Attendee: {res.get('attendee_email', 'N/A')}\n"
+                                f"Meet link: {res.get('meet_link')}"),
+                "type": "meeting",
+                "source": "ai_meeting",
+            })
+            todos.append({"text": f"Prepare for: {title}", "source": "ai_meeting"})
+    return cal_events, todos
 
 
 # ============================================================================ #
@@ -215,6 +237,15 @@ async def chat_node(state: OrbixState) -> OrbixState:
         trace = result.get("trace", [])
         # run_turn may mint a session_id when none was supplied — keep it
         state["session_id"] = result.get("session_id", session_id)
+
+        # Surface any calendar-affecting actions the agent took (create_meet /
+        # create_calendar_event) so the frontend's calendar/todo auto-sync keeps
+        # working now that actions run inside the agent instead of action_node.
+        cal_events, todos = _calendar_events_from_trace(trace)
+        if cal_events:
+            state["calendar_events"] = cal_events
+        if todos:
+            state["todo_items"] = todos
 
         state["module_output"] = {
             "response": response,
@@ -362,170 +393,6 @@ async def travel_node(state: OrbixState) -> OrbixState:
         })
     
     state["step"] = "travel_node"
-    return state
-
-
-def action_node(state: OrbixState) -> OrbixState:
-    """
-    Action executor module — handles send_email, create_meeting, meeting_and_email,
-    schedule_meeting and get_emails.
-
-    Reuses the classification already produced by route_query (no second LLM call).
-    Mirrors the proven legacy /chat pipeline: creates a real Google Meet link,
-    sends the invite email, records a calendar event + todo, and surfaces those to
-    the frontend via state["calendar_events"] / state["todo_items"].
-    """
-    from datetime import datetime
-    session_id = state["session_id"]
-    user_query = state["user_query"]
-    intent = state.get("intent", "unknown")
-
-    try:
-        logger.info(f"Action node: executing {intent} for '{user_query[:50]}...'")
-
-        from google_service.mail_generator import MailGenerator
-        import calendar_store
-
-        # Reuse routing's classification; only re-classify if it's missing.
-        classification = state.get("classification") or {}
-        if not classification:
-            from intent_workflow.intent_classifier import IntentClassifier
-            classification = IntentClassifier.classify(user_query) or {}
-
-        extracted_intent = classification.get("intent", intent)
-        parameters = classification.get("parameters", {}) or {}
-        email_content = classification.get("email_content", {}) or {}
-
-        # Cross-fill recipient / attendee
-        recipient = parameters.get("recipient_email") or parameters.get("attendee_email")
-
-        response = None
-        action_data = {}
-        calendar_events = []
-        todo_items = []
-
-        gmail = _get_gmail_client()
-
-        # ── get_emails ──────────────────────────────────────────────────────
-        if extracted_intent == "get_emails":
-            if not gmail:
-                raise ValueError("Gmail isn't connected. Please sign in first.")
-            _emit(state, "Fetching your emails…")
-            max_results = int(parameters.get("max_results", 10))
-            emails = gmail.get_latest_emails(max_results)
-            response = f"Fetched {len(emails)} email(s)."
-            action_data = {"emails_retrieved": True, "count": len(emails), "emails": emails}
-
-        # ── email / meeting intents ─────────────────────────────────────────
-        elif extracted_intent in ("send_email", "meeting_and_email",
-                                   "create_meeting", "schedule_meeting"):
-            if not recipient and extracted_intent != "create_meeting":
-                raise ValueError("Please mention the recipient's email address.")
-            if not gmail:
-                raise ValueError("Gmail isn't connected. Please sign in first.")
-
-            meet_link = None
-            event_title = parameters.get("event_title", "Meeting")
-            parts = []
-
-            # Step A: create a Google Meet for meeting-type intents
-            if extracted_intent in ("meeting_and_email", "create_meeting", "schedule_meeting"):
-                _emit(state, "Creating Google Meet…")
-                try:
-                    meet_result = gmail.create_google_meet(
-                        event_title,
-                        parameters.get("event_description", ""),
-                        recipient or "",
-                    )
-                    if meet_result.get("success"):
-                        meet_link = meet_result.get("meet_link")
-                        parts.append(f"**Google Meet created:** {meet_link}")
-                    else:
-                        parts.append(f"Meet creation failed: {meet_result.get('error', 'unknown')}")
-                except Exception as e:
-                    parts.append(f"Meet creation failed: {e}")
-
-            # Step B: send the email (skip for pure create_meeting)
-            if extracted_intent != "create_meeting":
-                _emit(state, f"Sending email to {recipient}…")
-                if not email_content.get("subject") or not email_content.get("body"):
-                    email_content = MailGenerator.generate_mail_content(
-                        user_prompt=parameters.get("event_description", "") or user_query,
-                        recipient_name=parameters.get("recipient_name", recipient.split("@")[0]),
-                        meeting_link=meet_link,
-                        prefilled=email_content,
-                    )
-                body = email_content.get("body", "")
-                if meet_link and meet_link not in body:
-                    body += f"\n\nGoogle Meet Link: {meet_link}"
-                send_result = gmail.send_email(recipient, email_content.get("subject", ""), body)
-                if send_result.get("success"):
-                    subj = email_content.get("subject", "")
-                    parts.append(f"**Email sent** to {recipient}"
-                                 + (f"\n**Subject:** {subj}" if subj else ""))
-                    action_data["email_sent"] = True
-                    action_data["recipient"] = recipient
-                else:
-                    parts.append(f"Email to {recipient} failed: {send_result.get('error', 'unknown')}")
-
-            # Step C: record a calendar event for the meeting
-            if extracted_intent in ("meeting_and_email", "create_meeting", "schedule_meeting"):
-                meeting_date = (parameters.get("start_time") or "")[:10] or datetime.utcnow().strftime("%Y-%m-%d")
-                meeting_time = (parameters.get("start_time") or "")[11:16]
-                ev = calendar_store.create_event(
-                    title=event_title,
-                    date=meeting_date,
-                    time=meeting_time,
-                    description=f"Attendee: {recipient or 'N/A'}\nMeet link: {meet_link or 'N/A'}",
-                    type="meeting",
-                    source="ai_meeting",
-                )
-                calendar_events.append(ev)
-                todo_items.append({"text": f"Prepare for: {event_title}", "source": "ai_meeting"})
-                action_data["event_created"] = True
-
-            response = "\n\n".join(parts) if parts else "Done."
-
-        else:
-            response = f"I don't recognize the action '{extracted_intent}'. Please try again."
-            action_data = {"error": f"Unknown action: {extracted_intent}"}
-
-        state["module_output"] = {
-            "response": response,
-            "module": "action",
-            "data": action_data,
-        }
-        state["calendar_events"] = calendar_events
-        state["todo_items"] = todo_items
-
-        # Save messages to SQLite
-        add_message(session_id, "user", user_query)
-        add_message(session_id, "assistant", response)
-
-        # Enqueue for extraction (Phase 3)
-        state["extraction_tasks"].append({
-            "type": "extract_action",
-            "action": extracted_intent,
-            "parameters": parameters,
-            "session_id": session_id,
-        })
-
-        logger.info(f"Action node completed: {extracted_intent}")
-
-    except Exception as e:
-        logger.error(f"Action node error: {e}", exc_info=True)
-        state["module_output"] = {
-            "response": f"I couldn't complete that action: {str(e)}",
-            "module": "action",
-            "data": {"error": str(e)}
-        }
-        state["errors"].append({
-            "step": "action_node",
-            "error": str(e),
-            "timestamp": time.time()
-        })
-    
-    state["step"] = "action_node"
     return state
 
 
@@ -687,35 +554,33 @@ def build_workflow():
     """
     graph = StateGraph(OrbixState)
     
-    # Add all nodes
+    # Add all nodes. Gmail/Meet/calendar actions no longer have a dedicated node —
+    # the chat_node (MCP agent) executes them as tool calls.
     graph.add_node("route_query", route_query)
     graph.add_node("prepare_context", prepare_context)
     graph.add_node("chat_node", chat_node)
     graph.add_node("travel_node", travel_node)
-    graph.add_node("action_node", action_node)
     graph.add_node("format_response", format_response)
     graph.add_node("background_tasks", background_tasks)
-    
+
     # Define edges
     graph.add_edge(START, "route_query")
     graph.add_edge("route_query", "prepare_context")
-    
-    # Conditional routing to module nodes
+
+    # Conditional routing to module nodes (chat handles general + all actions)
     graph.add_conditional_edges(
         "prepare_context",
         determine_module,  # routing function
         {
             "chat_node": "chat_node",
             "travel_node": "travel_node",
-            "action_node": "action_node",
         }
     )
-    
+
     # All module nodes go to format_response
     graph.add_edge("chat_node", "format_response")
     graph.add_edge("travel_node", "format_response")
-    graph.add_edge("action_node", "format_response")
-    
+
     # Format → background tasks → end
     graph.add_edge("format_response", "background_tasks")
     graph.add_edge("background_tasks", END)

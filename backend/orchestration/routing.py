@@ -38,13 +38,16 @@ _INTENT_PATTERNS = {
 }
 
 
-# Map intent → LangGraph module node
+# Map intent → LangGraph module node.
+# Gmail / Meet / calendar actions now run through the MCP agent (the "chat" module):
+# the model plans and executes them as tool calls with reasoning/chaining, instead of
+# a hardcoded action_node. Only travel keeps its own dedicated branch.
 _MODULE_MAP = {
-    "send_email": "action",
-    "create_meeting": "action",
-    "meeting_and_email": "action",
-    "schedule_meeting": "action",
-    "get_emails": "action",
+    "send_email": "chat",
+    "create_meeting": "chat",
+    "meeting_and_email": "chat",
+    "schedule_meeting": "chat",
+    "get_emails": "chat",
     "travel_planner": "travel",
     "general_chat": "chat",
 }
@@ -92,19 +95,9 @@ def route_query(state: OrbixState) -> OrbixState:
         intent, confidence = _regex_route(user_query)
         logger.info(f"Regex router → intent={intent} (confidence={confidence:.2f})")
 
-    # Normalize params so action_node has both recipient_email / attendee_email
-    params = classification.get("parameters", {}) if isinstance(classification, dict) else {}
-    if "attendee_email" in params and "recipient_email" not in params:
-        params["recipient_email"] = params["attendee_email"]
-    elif "recipient_email" in params and "attendee_email" not in params:
-        params["attendee_email"] = params["recipient_email"]
-
-    # Auto-upgrade create_meeting → meeting_and_email when an email is present
-    if intent == "create_meeting" and (params.get("attendee_email") or params.get("recipient_email")):
-        intent = "meeting_and_email"
-        if isinstance(classification, dict):
-            classification["intent"] = intent
-
+    # The MCP agent reads the raw user query and decides which tools to call, so no
+    # param normalization / intent-upgrade is needed here anymore — routing only picks
+    # the branch (chat vs travel).
     module_name = _MODULE_MAP.get(intent, "chat")
 
     state["intent"] = intent
@@ -126,6 +119,5 @@ def determine_module(state: OrbixState) -> str:
     node_map = {
         "chat": "chat_node",
         "travel": "travel_node",
-        "action": "action_node",
     }
     return node_map.get(module, "chat_node")

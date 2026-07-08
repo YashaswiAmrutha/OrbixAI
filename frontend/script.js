@@ -153,6 +153,7 @@ function removeElement(el) {
 // ── Thinking bubble ──────────────────────────────────────────────────────────
 let _thinkingEl  = null;
 let _thinkStart  = 0;
+let _lastThinkStep = "";
 
 function showThinking() {
   if (_thinkingEl) removeElement(_thinkingEl);
@@ -186,6 +187,13 @@ function addThinkingStep(step) {
   });
   div.classList.add("current");
   steps.appendChild(div);
+  // Reflect the live action in the bubble header so the user always sees what is
+  // actually happening right now (not a generic "Thinking…").
+  if (_thinkingEl) {
+    const label = _thinkingEl.querySelector(".thinking-label");
+    if (label) label.textContent = step;
+    _lastThinkStep = step;
+  }
   scrollToBottom();
 }
 
@@ -196,9 +204,16 @@ function collapseThinking() {
   if (bubble) {
     bubble.classList.add("collapsed", "done");
     const label = bubble.querySelector(".thinking-label");
-    if (label) label.textContent = `Thought for ${secs}s`;
+    // Show the last real action taken (+ time) instead of just a timer, so the
+    // collapsed one-liner says what happened. Click still expands the full trace.
+    if (label) {
+      const summary = (_lastThinkStep && !/^(thinking|understanding)/i.test(_lastThinkStep))
+        ? _lastThinkStep : "Done";
+      label.textContent = `${summary} · ${secs}s`;
+    }
   }
   _thinkingEl = null;
+  _lastThinkStep = "";
 }
 
 // ── Chat / Send ───────────────────────────────────────────────────────────────

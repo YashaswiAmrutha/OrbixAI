@@ -20,7 +20,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 ORCHESTRATOR_MODEL = "gpraneeth555/Llama-3-13k:latest"
-FALLBACK_MODEL     = "llama3.1:8b"
+FALLBACK_MODEL     = "llama3.2:3b"
 
 # ── GPU workaround: model must run on CPU (CUDA runtime issue on this machine) ─
 _OLLAMA_OPTIONS = {"temperature": 0.1, "num_predict": 1024, "num_gpu": 0}
