@@ -14,8 +14,13 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Gmail API scope
-SCOPES = ['https://www.googleapis.com/auth/gmail.modify', 'https://www.googleapis.com/auth/calendar']
+# Google API scopes. Gmail + Calendar power the gsuite server; drive.readonly lets the
+# optional Google Drive integration reuse this same sign-in. Adding a scope here does
+# NOT invalidate an existing token (Gmail/Calendar keep working); Drive access is only
+# granted the next time the user re-runs Connect with Google.
+SCOPES = ['https://www.googleapis.com/auth/gmail.modify',
+          'https://www.googleapis.com/auth/calendar',
+          'https://www.googleapis.com/auth/drive.readonly']
 
 
 _EMAIL_CACHE_TTL = 25  # seconds — slightly less than the 30s auto-refresh interval

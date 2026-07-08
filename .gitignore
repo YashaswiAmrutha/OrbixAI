@@ -15,6 +15,10 @@ __pycache__/
 backend/credentials.json
 backend/token.json
 
+# MCP runtime state (per-user server toggles + agent-managed to-do store)
+backend/mcp_state.json
+backend/tasks_store.json
+
 ############################
 # NODE / ELECTRON
 ############################

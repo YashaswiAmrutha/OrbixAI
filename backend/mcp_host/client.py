@@ -25,31 +25,48 @@ from contextlib import AsyncExitStack
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+# Make the registry importable whether this file is imported as a package member or
+# run alongside agent.py (which inserts backend/mcp_host on sys.path).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    import registry  # type: ignore
+except Exception:  # noqa: BLE001 — registry is optional; fall back to a static roster
+    registry = None
+
 logger = logging.getLogger(__name__)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _MEMORY_SERVER = _REPO_ROOT / "backend" / "mcp_servers" / "memory_server.py"
 _GSUITE_SERVER = _REPO_ROOT / "backend" / "mcp_servers" / "gsuite_server.py"
 
-# Default server roster. Use the current interpreter + absolute paths so spawning
-# never depends on PATH or the working directory.
-DEFAULT_SERVERS: dict[str, dict] = {
-    "orbix-memory": {
-        "command": sys.executable,
-        "args": [str(_MEMORY_SERVER)],
-    },
-    # Gmail / Google Meet / calendar actions — the agent's "hands".
-    "orbix-gsuite": {
-        "command": sys.executable,
-        "args": [str(_GSUITE_SERVER)],
-    },
+# Fallback roster if the registry is unavailable — the two always-on core servers.
+_FALLBACK_SERVERS: dict[str, dict] = {
+    "orbix-memory": {"command": sys.executable, "args": [str(_MEMORY_SERVER)]},
+    "orbix-gsuite": {"command": sys.executable, "args": [str(_GSUITE_SERVER)]},
 }
 
 
+def default_servers() -> dict[str, dict]:
+    """The roster to spawn: whatever the user has enabled in the registry, or the
+    core fallback if the registry can't be read. Never raises."""
+    if registry is not None:
+        try:
+            specs = registry.enabled_server_specs()
+            if specs:
+                return specs
+        except Exception as e:  # noqa: BLE001
+            logger.error("registry.enabled_server_specs failed (%s); using fallback", e)
+    return _FALLBACK_SERVERS
+
+
+# Back-compat alias (some call sites / tests reference DEFAULT_SERVERS).
+DEFAULT_SERVERS = _FALLBACK_SERVERS
+
+
 def load_servers(config_path: str | Path | None = None) -> dict[str, dict]:
-    """Load a server roster from a JSON file ({"mcpServers": {...}}), or the default."""
+    """Load a server roster from a JSON file ({"mcpServers": {...}}), or the enabled set."""
     if config_path is None:
-        return DEFAULT_SERVERS
+        return default_servers()
     data = json.loads(Path(config_path).read_text(encoding="utf-8"))
     return data.get("mcpServers", data)
 
@@ -75,29 +92,45 @@ def _tool_result_to_python(result) -> object:
 
 class MCPClientManager:
     def __init__(self, servers: dict[str, dict] | None = None):
-        self.servers = servers or DEFAULT_SERVERS
+        # None → the user's currently-enabled roster (resolved fresh each turn so a
+        # toggle in the UI takes effect on the very next request).
+        self.servers = servers if servers is not None else default_servers()
         self._stack = AsyncExitStack()
         self.sessions: dict[str, ClientSession] = {}
         # tool name -> (server_name, mcp.types.Tool)
         self.tool_index: dict[str, tuple[str, object]] = {}
+        # servers that failed to start this turn (name -> error) — never fatal
+        self.failed: dict[str, str] = {}
 
     async def __aenter__(self) -> "MCPClientManager":
+        # Start each enabled server independently. A server that fails to spawn
+        # (missing dependency, bad config, DB down) is recorded and SKIPPED — the
+        # rest of the roster and the whole turn continue. This is what lets the
+        # frontend enable/disable servers without ever breaking the backend.
         for name, spec in self.servers.items():
-            params = StdioServerParameters(
-                command=spec["command"], args=spec.get("args", []),
-                env=spec.get("env"),
-            )
-            read, write = await self._stack.enter_async_context(stdio_client(params))
-            session = await self._stack.enter_async_context(ClientSession(read, write))
-            await session.initialize()
+            try:
+                params = StdioServerParameters(
+                    command=spec["command"], args=spec.get("args", []),
+                    env=spec.get("env"),
+                )
+                read, write = await self._stack.enter_async_context(stdio_client(params))
+                session = await self._stack.enter_async_context(ClientSession(read, write))
+                await session.initialize()
+                listed = await session.list_tools()
+            except Exception as e:  # noqa: BLE001
+                self.failed[name] = str(e)
+                logger.error("MCP server %r failed to start (skipping): %s", name, e)
+                continue
             self.sessions[name] = session
-            listed = await session.list_tools()
             for tool in listed.tools:
                 if tool.name in self.tool_index:
                     logger.warning("Tool name collision %r (servers %s / %s)",
                                    tool.name, self.tool_index[tool.name][0], name)
                 self.tool_index[tool.name] = (name, tool)
             logger.info("MCP server %r up: %d tools", name, len(listed.tools))
+        if self.failed:
+            logger.warning("MCP servers unavailable this turn: %s",
+                           ", ".join(self.failed))
         return self
 
     async def __aexit__(self, *exc) -> None:

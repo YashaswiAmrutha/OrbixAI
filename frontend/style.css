@@ -1104,6 +1104,18 @@ body.light-mode ::-webkit-calendar-picker-indicator { filter: none; }
   color: var(--txt3); margin: 24px 2px 9px;
 }
 
+/* Summary stat pills */
+.mcp-stats { display: flex; gap: 10px; margin-top: 16px; }
+.mcp-stat {
+  display: flex; flex-direction: column; align-items: center; gap: 1px;
+  padding: 9px 16px; border-radius: var(--r-md);
+  border: 1px solid var(--border); background: var(--bg3); min-width: 74px;
+}
+.mcp-stat b { font-size: 18px; font-weight: 700; color: var(--txt1); letter-spacing: -0.02em; }
+.mcp-stat span { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--txt3); font-weight: 600; }
+.mcp-stat.on b    { color: var(--green-text); }
+.mcp-stat.setup b { color: var(--blue-text, #58a6ff); }
+
 .mcp-row {
   display: flex;
   align-items: center;
@@ -1113,7 +1125,7 @@ body.light-mode ::-webkit-calendar-picker-indicator { filter: none; }
   border-radius: var(--r-md);
   background: var(--bg3);
   cursor: pointer;
-  transition: background var(--t), border-color var(--t);
+  transition: background var(--t), border-color var(--t), opacity var(--t);
   margin-bottom: 8px;
   width: 100%;
   text-align: left;
@@ -1121,6 +1133,18 @@ body.light-mode ::-webkit-calendar-picker-indicator { filter: none; }
 }
 .mcp-row:hover { background: var(--surface); border-color: var(--border2); }
 .mcp-row:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* Disabled servers read as dimmed but stay interactive (you can still toggle/open) */
+.mcp-row.off .mcp-icon,
+.mcp-row.off .mcp-row-name,
+.mcp-row.off .mcp-row-desc { opacity: 0.55; }
+
+/* "requires" mini-badge next to the name */
+.mcp-req {
+  display: inline-block; margin-left: 8px; vertical-align: middle;
+  font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.4px;
+  color: var(--txt3); background: var(--surface);
+  border: 1px solid var(--border); border-radius: 5px; padding: 1px 6px;
+}
 
 .mcp-icon {
   width: 40px; height: 40px;
@@ -1144,6 +1168,50 @@ body.light-mode ::-webkit-calendar-picker-indicator { filter: none; }
 .mcp-status.connected { color: var(--green-text); background: rgba(63,185,80,0.09); border-color: rgba(63,185,80,0.28); }
 .mcp-status.available { color: var(--txt3); }
 .mcp-status.local     { color: var(--blue-text); }
+.mcp-status.disabled  { color: var(--txt3); background: transparent; opacity: 0.75; }
+
+/* ─── Toggle switch (enable/disable a server) ───────────────────────────── */
+.mcp-switch { position: relative; display: inline-flex; align-items: center; flex-shrink: 0; cursor: pointer; }
+.mcp-switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+.mcp-switch-track {
+  width: 38px; height: 22px; border-radius: 99px;
+  background: var(--surface); border: 1px solid var(--border2);
+  transition: background var(--t), border-color var(--t);
+  display: inline-flex; align-items: center; padding: 2px;
+}
+.mcp-switch-thumb {
+  width: 16px; height: 16px; border-radius: 50%;
+  background: var(--txt3);
+  transition: transform var(--t), background var(--t);
+}
+.mcp-switch input:checked + .mcp-switch-track {
+  background: rgba(63,185,80,0.20); border-color: rgba(63,185,80,0.45);
+}
+.mcp-switch input:checked + .mcp-switch-track .mcp-switch-thumb {
+  transform: translateX(16px); background: var(--green-text);
+}
+.mcp-switch input:disabled + .mcp-switch-track { opacity: 0.5; cursor: not-allowed; }
+.mcp-switch input:focus-visible + .mcp-switch-track { outline: 2px solid var(--accent); outline-offset: 2px; }
+.mcp-detail-head .mcp-switch { margin-left: auto; }
+
+/* ─── Config fields (e.g. Filesystem allowed roots) ─────────────────────── */
+.mcp-cfg { display: flex; flex-direction: column; gap: 12px; }
+.mcp-cfg-field { display: flex; flex-direction: column; gap: 5px; }
+.mcp-cfg-field label { font-size: 12px; color: var(--txt2); font-weight: 500; }
+.mcp-cfg-input {
+  padding: 9px 12px; border-radius: var(--r-sm);
+  border: 1px solid var(--border2); background: var(--bg3); color: var(--txt1);
+  font-family: inherit; font-size: 13px; outline: none;
+  transition: border-color var(--t);
+}
+.mcp-cfg-input:focus { border-color: var(--accent); }
+.mcp-cfg .mcp-connect-btn { align-self: flex-start; }
+
+.mcp-empty {
+  font-size: 13px; color: var(--txt3); text-align: center;
+  padding: 28px 16px; border: 1px dashed var(--border2);
+  border-radius: var(--r-md); background: var(--bg3); margin-top: 12px;
+}
 
 .mcp-chevron { color: var(--txt3); flex-shrink: 0; transition: transform var(--t), color var(--t); }
 .mcp-row:hover .mcp-chevron { color: var(--txt1); transform: translateX(2px); }

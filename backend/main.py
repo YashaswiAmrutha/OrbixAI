@@ -204,6 +204,48 @@ def health_check():
     return {"message": "Orbii Backend API is running", "status": "ok"}
 
 
+# ============ MCP INTEGRATIONS (enable/disable servers) ============
+# The frontend Integrations page reads and toggles the MCP server roster here.
+# Toggling only records intent in mcp_state.json; the agent picks up the enabled set
+# on its next turn. A disabled/misconfigured server is simply skipped by the host, so
+# nothing here can break the running backend.
+
+@app.get("/mcp/servers")
+def mcp_list_servers():
+    """List every known MCP integration with its enabled state + config (secrets redacted)."""
+    try:
+        from mcp_host import registry
+        return {"servers": registry.list_servers()}
+    except Exception as e:
+        logger.error(f"mcp_list_servers error: {e}", exc_info=True)
+        return {"servers": [], "error": str(e)}
+
+
+@app.post("/mcp/servers/{server_id}")
+def mcp_update_server(server_id: str, payload: dict):
+    """
+    Enable/disable a server and/or update its config.
+    Body: {"enabled": bool?, "config": {..}?}. Returns the updated server view.
+    """
+    try:
+        from mcp_host import registry
+        updated = None
+        if "config" in payload and isinstance(payload["config"], dict):
+            updated = registry.set_config(server_id, payload["config"])
+        if "enabled" in payload:
+            updated = registry.set_enabled(server_id, bool(payload["enabled"]))
+        if updated is None:
+            # no recognized field, or unknown id
+            from mcp_host.registry import _one, _BY_ID  # type: ignore
+            if server_id not in _BY_ID:
+                return {"success": False, "error": f"unknown server '{server_id}'"}
+            updated = _one(server_id)
+        return {"success": True, "server": updated}
+    except Exception as e:
+        logger.error(f"mcp_update_server error: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
 # ============ LANGGRAPH WORKFLOW ENDPOINTS (Phase 1) ============
 
 @app.post("/workflow/chat")

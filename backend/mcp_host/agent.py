@@ -43,9 +43,11 @@ logger = logging.getLogger(__name__)
 # A tool-calling model. Override with env ORBIX_AGENT_MODEL.
 AGENT_MODEL = os.environ.get("ORBIX_AGENT_MODEL", "llama3.2:3b")
 MAX_STEPS = int(os.environ.get("ORBIX_AGENT_MAX_STEPS", "8"))
-# MCP server whose write tools the agent is allowed to CALL (take actions with).
-# Memory writes stay excluded — the background extractor is memory's single write path.
-_ACTION_SERVER = "orbix-gsuite"
+# The one server whose WRITE tools the agent must NOT call directly: memory. Its
+# durable writes go through the background extractor (memory's single write path).
+# Every OTHER enabled server's action tools (gsuite, files, tasks, …) are fair game,
+# so the brain can act across any combination of connected integrations.
+_MEMORY_SERVER = "orbix-memory"
 # Match the project's CPU-only Ollama setup (CUDA issues on this machine).
 _OPTIONS = {"temperature": 0.2, "num_gpu": int(os.environ.get("OLLAMA_NUM_GPU", "0"))}
 
@@ -75,10 +77,14 @@ def _system_prompt() -> str:
         "user just told you this session even if it isn't in the graph yet.\n"
         "5. Keep replies concise and natural. Do not mention tools, keys, or memory "
         "internals to the user.\n\n"
-        "ACTIONS — you can DO things, not just talk:\n"
-        "A. To send mail use `send_email`; to make a video meeting use `create_meet`; "
-        "to put something on the calendar use `create_calendar_event`; to read the "
-        "inbox use `list_emails`. Call the tool — don't just describe what you'd do.\n"
+        "ACTIONS — you can DO things, not just talk. Your available tools depend on "
+        "which integrations are enabled; only ever call a tool that is actually in your "
+        "tool list this turn. Common ones:\n"
+        "A. Mail/meetings/calendar: `send_email`, `create_meet` (Google Meet link), "
+        "`create_calendar_event`, `list_emails`, `list_calendar_events`. Web: "
+        "`web_search` to look things up and `fetch_url` to read a page. Files: "
+        "`read_file`, `search_files`, `write_file` (scoped folders). Tasks: `add_task`, "
+        "`list_tasks`, `complete_task`. Call the tool — don't just describe what you'd do.\n"
         "B. Only do what the user asked. Do NOT invent extra details — no meeting link "
         "unless they asked for a meeting AND you actually called `create_meet`; no "
         "attachments, dates, or people they didn't mention.\n"
@@ -97,6 +103,9 @@ def _system_prompt() -> str:
         "reliable way — do NOT just create the meet and stop, and do not claim you emailed "
         "the link unless the result shows emailed:true (or a send_email returned sent:true).\n"
         "   • 'email A and B' → call `send_email` once per recipient.\n"
+        "   • 'set up a meeting with X and put it on my calendar and remind me' → "
+        "`create_meet` (with email_link_to), THEN `create_calendar_event`, THEN "
+        "`add_task` — do every part the user named.\n"
         "Only give your final plain-text reply once NOTHING is left to do.\n"
         "E. NEVER claim an action succeeded unless the tool result confirms it "
         "(send_email returns sent:true; create_meet returns a meet_link). If a tool "
@@ -194,6 +203,74 @@ def _friendly_step(name: str, args: dict) -> str:
         return "Checking your calendar…"
     if name == "delete_calendar_event":
         return "Removing a calendar event…"
+    # web tools
+    if name == "web_search":
+        return f"Searching the web for “{args.get('query', '')}”…"
+    if name == "fetch_url":
+        return f"Reading {args.get('url', 'the page')}…"
+    # filesystem tools
+    if name == "read_file":
+        return f"Reading {args.get('path', 'a file')}…"
+    if name == "write_file":
+        return f"Saving {args.get('path', 'a file')}…"
+    if name == "search_files":
+        return f"Searching files for “{args.get('query', '')}”…"
+    if name == "list_directory":
+        return "Listing files…"
+    # task tools
+    if name == "add_task":
+        return f"Adding a to-do: “{args.get('text', '')}”…"
+    if name in ("complete_task", "list_tasks", "delete_task"):
+        return "Updating your to-do list…"
+    # neo4j cypher tools
+    if name == "run_cypher":
+        return "Querying the knowledge graph…"
+    if name == "get_schema":
+        return "Reading the graph schema…"
+    # github tools
+    if name == "gh_search_repos":
+        return f"Searching GitHub repos for “{args.get('query', '')}”…"
+    if name == "gh_search_code":
+        return f"Searching GitHub code for “{args.get('query', '')}”…"
+    if name in ("gh_get_repo", "gh_list_issues"):
+        return f"Reading GitHub {args.get('repo', 'repository')}…"
+    if name == "gh_create_issue":
+        return f"Opening a GitHub issue on {args.get('repo', '')}…"
+    if name == "gh_whoami":
+        return "Checking your GitHub account…"
+    # git (local) tools
+    if name in ("git_status", "git_log", "git_diff", "git_branches"):
+        return "Inspecting your local repo…"
+    if name == "git_grep":
+        return f"Searching the repo for “{args.get('query', '')}”…"
+    # maps tools
+    if name == "geocode":
+        return f"Locating “{args.get('address', '')}”…"
+    if name == "search_places":
+        return f"Finding places for “{args.get('query', '')}”…"
+    if name == "directions":
+        return f"Getting directions to {args.get('destination', '')}…"
+    # notion tools
+    if name == "notion_search":
+        return f"Searching Notion for “{args.get('query', '')}”…"
+    if name == "notion_get_page":
+        return "Reading a Notion page…"
+    if name == "notion_append_text":
+        return "Adding a note to Notion…"
+    # slack tools
+    if name == "slack_list_channels":
+        return "Listing your Slack channels…"
+    if name == "slack_read_channel":
+        return "Reading a Slack channel…"
+    if name == "slack_post_message":
+        return "Posting to Slack…"
+    # google drive tools
+    if name == "drive_search":
+        return f"Searching your Drive for “{args.get('query', '')}”…"
+    if name == "drive_list_recent":
+        return "Listing recent Drive files…"
+    if name == "drive_read_file":
+        return "Reading a Drive file…"
     return f"Working ({name})…"
 
 
@@ -219,6 +296,31 @@ def _result_step(name: str, result) -> str | None:
         return "✓ Removed the calendar event"
     if name == "list_emails" and isinstance(result, dict):
         return f"✓ Found {result.get('count', 0)} emails"
+    if name == "web_search" and isinstance(result, dict):
+        return f"✓ Found {result.get('count', 0)} web results"
+    if name == "fetch_url" and isinstance(result, dict) and result.get("title"):
+        return f"✓ Read “{str(result.get('title'))[:60]}”"
+    if name == "write_file" and isinstance(result, dict) and result.get("written"):
+        return f"✓ Saved {result.get('path', 'file')}"
+    if name == "add_task" and isinstance(result, dict) and result.get("added"):
+        return f"✓ Added to-do: “{result.get('text', '')}”"
+    if name == "complete_task" and isinstance(result, dict) and result.get("completed"):
+        return "✓ Marked a task done"
+    if name == "run_cypher" and isinstance(result, dict) and "count" in result:
+        return f"✓ Query returned {result.get('count', 0)} row(s)"
+    if name == "gh_create_issue" and isinstance(result, dict) and result.get("created"):
+        return f"✓ Opened GitHub issue #{result.get('number')}"
+    if name in ("gh_search_repos", "gh_search_code") and isinstance(result, dict):
+        n = len(result.get("repos") or result.get("results") or [])
+        return f"✓ Found {n} GitHub result(s)"
+    if name == "drive_search" and isinstance(result, dict) and "count" in result:
+        return f"✓ Found {result.get('count', 0)} Drive file(s)"
+    if name == "slack_post_message" and isinstance(result, dict) and result.get("posted"):
+        return "✓ Posted to Slack"
+    if name == "notion_append_text" and isinstance(result, dict) and result.get("appended"):
+        return "✓ Added a note to Notion"
+    if name == "geocode" and isinstance(result, dict) and result.get("lat") is not None:
+        return f"✓ Found {result.get('address', 'location')}"
     return None
 
 
@@ -308,16 +410,19 @@ async def run_turn(user_text: str, session_id: str | None = None, *,
             pass
         messages = _messages_from_session(session_id, context)
 
-        # The brain may READ anything (memory recall, list emails/calendar) and may
-        # ACT via the gsuite server (send_email, create_meet, calendar CRUD). Memory
-        # WRITE tools stay excluded — the background extractor is memory's single write
-        # path, so keeping them out avoids races/duplication.
+        # The brain may READ anything (memory recall, list emails/calendar, web search,
+        # files, tasks) and may ACT via any enabled server EXCEPT memory (send_email,
+        # create_meet, calendar CRUD, write_file, add_task, …). Memory WRITE tools stay
+        # excluded — the background extractor is memory's single write path, so keeping
+        # them out avoids races/duplication. Whatever servers the user has enabled is
+        # exactly the tool surface here, so integrations compose in any order.
         def _allowed(name: str) -> bool:
-            return mcp.is_readonly(name) or mcp.server_of(name) == _ACTION_SERVER
+            return mcp.is_readonly(name) or mcp.server_of(name) != _MEMORY_SERVER
         tools = [t for t in mcp.ollama_tools()
                  if _allowed(t["function"]["name"])]
-        logger.info("Agent turn: model=%s, %d tools available (read + gsuite actions)",
-                    model, len(tools))
+        logger.info("Agent turn: model=%s, %d tools from %d server(s)%s",
+                    model, len(tools), len(mcp.sessions),
+                    (f"; unavailable: {', '.join(mcp.failed)}" if mcp.failed else ""))
 
         reply = ""
         reflected = False  # completion-check runs at most once per turn

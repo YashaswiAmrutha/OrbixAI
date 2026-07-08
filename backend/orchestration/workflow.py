@@ -126,6 +126,10 @@ def _calendar_events_from_trace(trace: list) -> tuple[list, list]:
                 "source": "ai_meeting",
             })
             todos.append({"text": f"Prepare for: {title}", "source": "ai_meeting"})
+        elif name == "add_task" and res.get("added") and res.get("text"):
+            # The agent added a to-do via the tasks MCP server — mirror it into the
+            # frontend To-Do panel so the UI stays in sync with what it created.
+            todos.append({"text": res["text"], "source": "ai_agent"})
     return cal_events, todos
 
 

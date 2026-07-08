@@ -15,6 +15,7 @@ python-dotenv
 neo4j
 PyYAML
 mcp
+beautifulsoup4
 langgraph
 langchain
 amadeus
