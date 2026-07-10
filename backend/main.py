@@ -1,27 +1,39 @@
-from fastapi import FastAPI, UploadFile, File, Request, BackgroundTasks
-from contextlib import asynccontextmanager
+#this is main.py
+from graph.memory_extractor import extract_memory
+from graph.memory_writer import save_memory
+from graph.memory_retriever import get_contact_email
+from graph.conversation_memory import (
+    add_message,
+    build_context,
+    get_recent_messages,
+    initialize_conversation_schema,
+    resolve_conversation_id,
+    resolve_referential_conversation_id,
+)
+
+from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from pathlib import Path
+
 from llm.ollama_client import generate_response
 from llm.prompt import build_prompt
 from llm.hf_client import orchestrate
+
 from google_service.gmail_client import GmailClient
 from google_service.mail_generator import MailGenerator
 from google_service.travel_planner import plan_trip
+
 from intent_workflow import IntentClassifier, WorkflowExecutor, WorkflowTask
-from calendar_store import get_events, create_event, bulk_create_events, update_event, delete_event
 from faster_whisper import WhisperModel
-from graph.working_memory import init_db as init_working_memory, cleanup_expired_messages
-from orchestration.workflow import run_workflow
 import asyncio
 import tempfile
 import json
-import re
-from datetime import datetime, timedelta
+from datetime import datetime
 import logging
 import os
+from uuid import uuid4
 
 # Force CPU-only mode to avoid CUDA library issues
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -43,45 +55,7 @@ logging.basicConfig(level=logging.DEBUG)
 # Frontend directory (used for serving static files and index.html)
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """On launch: ensure Ollama is serving, then drain any memory writes left
-    pending from a previous run (drain-on-startup). Initialize SQLite schema.
-    Never blocks fatally."""
-    try:
-        # Initialize SQLite working memory (creates tables if needed)
-        init_working_memory()
-        logger.info("Working memory SQLite initialized")
-    except Exception as e:
-        logger.error(f"Working memory init failed: {e}", exc_info=True)
-    
-    try:
-        from mcp_host import startup
-        await asyncio.to_thread(startup.run_startup)
-    except Exception as e:
-        logger.error("Startup orchestration failed (continuing): %s", e, exc_info=True)
-    yield
-
-
-def _drain_session_bg(session_id: str):
-    """Post-reply background extraction so Neo4j stays fresh (runs off the response)."""
-    try:
-        from mcp_host import extractor
-        extractor.drain(session_id=session_id)
-    except Exception as e:
-        logger.error("post-reply drain failed: %s", e)
-
-
-def _cleanup_expired_messages_bg():
-    """Daily cleanup: delete expired SQLite messages (24hr lifespan)."""
-    try:
-        result = cleanup_expired_messages()
-        logger.info(f"Expired messages cleanup: {result}")
-    except Exception as e:
-        logger.error(f"Cleanup failed: {e}")
-
-
-app = FastAPI(lifespan=lifespan)
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
@@ -95,6 +69,9 @@ model = None
 
 # Initialize Gmail client (lazy initialization)
 gmail_client = None
+email_fetch_lock = asyncio.Lock()
+email_cache = {"timestamp": 0.0, "max_results": None, "emails": []}
+EMAIL_CACHE_SECONDS = 30.0
 
 # Initialize Workflow Executor
 workflow_executor = WorkflowExecutor()
@@ -336,47 +313,6 @@ def register_workflows():
 # Initialize workflows on startup
 register_workflows()
 
-
-# ============ CALENDAR HELPERS ============
-def extract_travel_calendar_events(itinerary: str, destination: str,
-                                   departure_date: str = None) -> list:
-    """Parse day-wise itinerary text into calendar event dicts."""
-    events = []
-    base_date = None
-    if departure_date:
-        try:
-            base_date = datetime.strptime(departure_date, "%Y-%m-%d")
-        except Exception:
-            pass
-    if not base_date:
-        base_date = datetime.utcnow()
-
-    pattern = re.compile(r'day\s+(\d+)[:\s\-–]+([^\n]+)', re.IGNORECASE)
-    matches = pattern.findall(itinerary or "")
-
-    if matches:
-        for day_str, title in matches:
-            day_num = int(day_str)
-            event_date = base_date + timedelta(days=day_num - 1)
-            events.append({
-                "title": f"Day {day_num}: {title.strip()[:70]}",
-                "date": event_date.strftime("%Y-%m-%d"),
-                "time": "",
-                "description": f"Trip to {destination}",
-                "type": "travel",
-                "source": "ai_travel",
-            })
-    else:
-        events.append({
-            "title": f"Trip to {destination}",
-            "date": base_date.strftime("%Y-%m-%d"),
-            "time": "",
-            "description": (itinerary or "")[:400],
-            "type": "travel",
-            "source": "ai_travel",
-        })
-    return events
-
 @app.get("/")
 def serve_index():
     return FileResponse(FRONTEND_DIR / "index.html")
@@ -388,19 +324,6 @@ def auth_status():
     if client and client.is_authenticated():
         return {"authenticated": True}
     return {"authenticated": False, "auth_url": "/auth/login"}
-
-@app.get("/auth/profile")
-def auth_profile():
-    """Return the logged-in user's display name and email for personalization."""
-    client = get_gmail_client()
-    if not client or not client.is_authenticated():
-        return {"authenticated": False, "name": None, "email": None}
-    try:
-        prof = client.get_user_profile()
-        return {"authenticated": True, "name": prof.get("name"), "email": prof.get("email")}
-    except Exception as e:
-        logger.error(f"auth_profile error: {e}")
-        return {"authenticated": True, "name": None, "email": None}
 
 @app.get("/auth/login")
 def auth_login():
@@ -430,99 +353,21 @@ def auth_callback(request: Request):
 def health_check():
     return {"message": "Orbii Backend API is running", "status": "ok"}
 
-
-# ============ LANGGRAPH WORKFLOW ENDPOINTS (Phase 1) ============
-
-@app.post("/workflow/chat")
-async def workflow_chat(message: dict):
-    """
-    LangGraph workflow endpoint — Phase 1 testing.
-    
-    Request: {"message": "...", "session_id": "..."}
-    Response: Streaming SSE events
-      - {type: "thinking", step: "..."}
-      - {type: "response", reply: "...", module: "..."}
-    """
-    user_message = message.get("message", "").strip()
-    session_id = (message.get("session_id") or "").strip()
-    
-    if not user_message:
-        return {"error": "message is required"}
-    
-    if not session_id:
-        from graph.working_memory import start_session
-        session_id = start_session()
-    
-    logger.info(f"[LangGraph] Starting workflow for session {session_id}")
-    
-    async def generate():
-        """Stream SSE events from workflow execution."""
-        try:
-            yield f'data: {json.dumps({"type": "thinking", "step": "Starting workflow..."})}\n\n'
-            
-            # Run the LangGraph workflow
-            final_state = await run_workflow(user_message, session_id)
-            
-            # Extract response from final state
-            response = final_state.get("module_output", {}).get("formatted", "No response")
-            module = final_state.get("module_output", {}).get("module", "unknown")
-            
-            logger.info(f"[LangGraph] Workflow completed: module={module}")
-            
-            yield f'data: {json.dumps({"type": "response", "reply": response, "module": module, "session_id": session_id})}\n\n'
-            
-        except Exception as e:
-            logger.error(f"Workflow error: {e}", exc_info=True)
-            yield f'data: {json.dumps({"type": "error", "message": str(e)})}\n\n'
-    
-    return StreamingResponse(generate(), media_type="text/event-stream")
-
-
-@app.post("/workflow/cleanup")
-async def workflow_cleanup_now(background_tasks: BackgroundTasks):
-    """
-    Manually trigger cleanup of expired SQLite messages (for testing).
-    Normally this would run on a schedule (daily).
-    """
-    background_tasks.add_task(_cleanup_expired_messages_bg)
-    return {"status": "cleanup queued"}
-
-
-
-# ============ CALENDAR ENDPOINTS ============
-@app.get("/calendar/events")
-def list_calendar_events(year: int = None, month: int = None):
-    return {"events": get_events(year, month)}
-
-
-@app.post("/calendar/events")
-def add_calendar_event(payload: dict):
-    ev = create_event(**payload)
-    return {"success": True, "event": ev}
-
-
-@app.post("/calendar/events/bulk")
-def add_calendar_events_bulk(payload: dict):
-    events = bulk_create_events(payload.get("events", []))
-    return {"success": True, "events": events, "count": len(events)}
-
-
-@app.put("/calendar/events/{event_id}")
-def modify_calendar_event(event_id: str, payload: dict):
-    ev = update_event(event_id, **payload)
-    if ev:
-        return {"success": True, "event": ev}
-    return {"success": False, "error": "Event not found"}
-
-
-@app.delete("/calendar/events/{event_id}")
-def remove_calendar_event(event_id: str):
-    return {"success": delete_event(event_id)}
-
 @app.post("/chat")
 def chat(message: dict):
     try:
         user_text = message["message"]
+
+        try:
+            memory = extract_memory(user_text)
+            print("MEMORY:", memory)
+            if memory:
+                save_memory(memory)
+
+        except Exception as e:
+            logger.error(f"Memory save failed: {e}")
+        
+        
 
         # ── Single-shot orchestration via gpraneeth555/llama-3-13k ──────────
         classification  = IntentClassifier.classify(user_text)
@@ -583,6 +428,20 @@ def chat(message: dict):
         # ── email / meeting intents — execute directly ────────────────────────
         if intent in ("send_email", "meeting_and_email", "create_meeting", "schedule_meeting"):
             recipient = parameters.get("recipient_email") or parameters.get("attendee_email", "")
+
+            print("ORIGINAL RECIPIENT:", recipient)
+
+            if "@" not in recipient:
+
+                remembered_email = get_contact_email(recipient)
+
+                print("MEMORY LOOKUP:", remembered_email)
+
+                if remembered_email:
+                    recipient = remembered_email
+
+            print("FINAL RECIPIENT:", recipient)
+
             if not recipient:
                 return {"reply": "Please mention the recipient's email address.", "intent": intent}
 
@@ -644,9 +503,51 @@ async def chat_stream(message: dict):
       error     → {type:"error", message:"..."}
     """
     user_text = message.get("message", "")
-    loop = asyncio.get_event_loop()
+    requested_conversation_id = str(message.get("conversation_id") or uuid4())[:128]
+    conversation_id = requested_conversation_id
+    loop = asyncio.get_running_loop()
+    contextual_user_text = user_text
+    try:
+        await loop.run_in_executor(None, initialize_conversation_schema)
+        conversation_id = await loop.run_in_executor(
+            None, resolve_conversation_id, requested_conversation_id
+        )
+        conversation_id = await loop.run_in_executor(
+            None, resolve_referential_conversation_id, conversation_id, user_text
+        )
+        recent_messages = await loop.run_in_executor(
+            None, get_recent_messages, conversation_id, 12
+        )
+        contextual_user_text = build_context(recent_messages, user_text)
+        await loop.run_in_executor(
+            None, add_message, conversation_id, "user", user_text
+        )
+    except Exception as e:
+        logger.error("Conversation memory unavailable: %s", e)
+    try:
+        memory = extract_memory(user_text)
+        print("MEMORY:", memory)
+        if memory:
+                save_memory(memory)
+
+    except Exception as e:
+        logger.error(f"Memory save failed: {e}")
+    assistant_saved = False
 
     def _sse(obj: dict) -> str:
+        nonlocal assistant_saved
+        obj["conversation_id"] = conversation_id
+        if obj.get("type") == "response" and obj.get("reply") and not assistant_saved:
+            try:
+                add_message(
+                    conversation_id,
+                    "assistant",
+                    obj["reply"],
+                    {"intent": obj.get("intent")},
+                )
+                assistant_saved = True
+            except Exception as e:
+                logger.error("Assistant memory save failed: %s", e)
         return f"data: {json.dumps(obj)}\n\n"
 
     async def generate():
@@ -656,7 +557,7 @@ async def chat_stream(message: dict):
 
             # ── Intent classification (blocking → executor) ─────────────────
             classification = await loop.run_in_executor(
-                None, IntentClassifier.classify, user_text
+                None, IntentClassifier.classify, contextual_user_text
             )
             intent       = classification["intent"]
             parameters   = classification.get("parameters", {})
@@ -688,28 +589,13 @@ async def chat_stream(message: dict):
             if travel_plan_pre and travel_plan_pre.get("itinerary"):
                 parameters["travel_plan"] = travel_plan_pre
 
-            # ── general_chat → memory-aware MCP agent ────────────────────────
-            # Conversational/personal queries go through the agent (recall over Neo4j +
-            # background remember). Action intents above stay on the legacy pipeline.
+            # ── general_chat ────────────────────────────────────────────────
             if intent == "general_chat":
-                from mcp_host.agent import run_turn
-                sid = (message.get("session_id") or "").strip() or None
-                step_q = asyncio.Queue()
-                agent_task = asyncio.ensure_future(
-                    run_turn(user_text, session_id=sid, on_event=step_q.put))
-                # stream the agent's tool steps into the thinking bubble as they happen
-                while not (agent_task.done() and step_q.empty()):
-                    try:
-                        ev = await asyncio.wait_for(step_q.get(), timeout=0.2)
-                        yield _sse(ev)
-                        await asyncio.sleep(0)
-                    except asyncio.TimeoutError:
-                        continue
-                out = await agent_task
-                # remember-after: extract this turn into Neo4j off the response path
-                asyncio.create_task(asyncio.to_thread(_drain_session_bg, out["session_id"]))
-                yield _sse({"type": "response", "reply": out["reply"],
-                            "intent": "general_chat", "session_id": out["session_id"]})
+                yield _sse({"type": "thinking", "step": "Generating response…"})
+                await asyncio.sleep(0)
+                prompt = build_prompt(contextual_user_text)
+                reply  = await loop.run_in_executor(None, generate_response, prompt)
+                yield _sse({"type": "response", "reply": reply, "intent": intent})
                 return
 
             # ── travel_planner ──────────────────────────────────────────────
@@ -724,17 +610,35 @@ async def chat_stream(message: dict):
                     )
 
                 async def _run_plan():
-                    result = await loop.run_in_executor(
-                        None, lambda: plan_trip(user_text, emit=_emit)
-                    )
-                    await step_queue.put(None)  # sentinel
-                    return result
+                    try:
+                        result = await plan_trip(
+                                contextual_user_text,
+                                emit=_emit,
+                                request_text=user_text
+                            )
+                        return result
+                    finally:
+                        await step_queue.put(None)  # sentinel
 
                 plan_task = asyncio.ensure_future(_run_plan())
+                plan_deadline = loop.time() + 150
 
                 # Drain step queue while planning runs
                 while True:
-                    step = await step_queue.get()
+                    if loop.time() > plan_deadline:
+                        plan_task.cancel()
+                        yield _sse({
+                            "type": "response",
+                            "reply": "Travel search timed out. Please try again in a moment, or search flights/hotels separately.",
+                            "intent": intent,
+                        })
+                        return
+                    try:
+                        step = await asyncio.wait_for(step_queue.get(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        if plan_task.done():
+                            break
+                        continue
                     if step is None:
                         break
                     yield _sse({"type": "thinking", "step": step})
@@ -754,37 +658,66 @@ async def chat_stream(message: dict):
                 flights   = travel_result.get("flights", [])
                 hotels    = travel_result.get("hotels", [])
                 attrs     = travel_result.get("attractions", [])
+                scope     = travel_result.get("scope") or {
+                    "flights": True, "hotels": True,
+                    "attractions": True, "itinerary": True,
+                    "full_plan": True,
+                }
 
-                parts = [f"## Travel Plan for {dest}\n"]
-                if flights:
-                    parts.append("**✈ Best Flight:** " +
-                        f"{flights[0]['currency']} {flights[0]['price']} | "
-                        f"{flights[0]['departure']}→{flights[0]['arrival']} | "
-                        f"{flights[0]['duration']}")
-                if hotels:
-                    parts.append("**🏨 Top Hotel:** " +
-                        f"{hotels[0]['name']} — {hotels[0]['currency']} {hotels[0]['price']}/night")
-                if attrs:
+                if scope.get("full_plan"):
+                    heading = f"## Travel Plan for {dest}\n"
+                elif scope.get("flights") and not any((scope.get("hotels"), scope.get("itinerary"), scope.get("attractions"))):
+                    heading = f"## Flight details for {dest}\n"
+                elif scope.get("hotels") and not any((scope.get("flights"), scope.get("itinerary"), scope.get("attractions"))):
+                    heading = f"## Hotel options for {dest}\n"
+                elif scope.get("itinerary") and not any((scope.get("flights"), scope.get("hotels"))):
+                    heading = f"## Itinerary for {dest}\n"
+                else:
+                    heading = f"## Travel details for {dest}\n"
+
+                parts = [heading]
+                if scope.get("flights") and flights:
+                    note = flights[0].get("availability_note")
+                    if note:
+                        parts.append(f"_{note}_")
+                    flight_lines = []
+                    for index, flight in enumerate(flights[:3], 1):
+                        flight_lines.append(
+                            f"{index}. **{flight.get('airline', 'Flight')}** — "
+                            f"{flight.get('currency', '')} {flight.get('price', '')} | "
+                            f"{flight.get('departure', '')} → {flight.get('arrival', '')} | "
+                            f"{flight.get('duration', '')} | {flight.get('stops', '')}"
+                        )
+                    parts.append("### ✈ Flight options\n" + "\n".join(flight_lines))
+                elif scope.get("flights"):
+                    parts.append("No flight options were found for those details.")
+
+                if scope.get("hotels") and hotels:
+                    hotel_lines = []
+                    for index, hotel in enumerate(hotels[:3], 1):
+                        rating = f" | ⭐ {hotel.get('rating')}" if hotel.get("rating") else ""
+                        hotel_lines.append(
+                            f"{index}. **{hotel.get('name', 'Hotel')}** — "
+                            f"{hotel.get('currency', '')} {hotel.get('price', '')}/night{rating}"
+                        )
+                    parts.append("### 🏨 Hotel options\n" + "\n".join(hotel_lines))
+                elif scope.get("hotels"):
+                    parts.append("No hotel options were found for those details.")
+
+                if scope.get("attractions") and not scope.get("itinerary") and attrs:
                     top = ", ".join(a["name"] for a in attrs[:5])
                     parts.append(f"**📍 Top Attractions:** {top}")
-                parts.append("\n### Itinerary\n" + itinerary)
+                elif scope.get("attractions") and not scope.get("itinerary"):
+                    parts.append("No attractions were found for those details.")
 
-                # Auto-create calendar events from travel itinerary
-                cal_ev_defs = extract_travel_calendar_events(
-                    itinerary,
-                    dest,
-                    travel_result["entities"].get("departure_date"),
-                )
-                saved_cal_events = bulk_create_events(cal_ev_defs)
-                todo_items = [{"text": f"Plan trip to {dest}", "source": "ai_travel"}]
+                if scope.get("itinerary") and itinerary:
+                    parts.append("\n### Itinerary\n" + itinerary)
+                elif scope.get("itinerary"):
+                    parts.append("No itinerary could be generated for those details.")
 
-                yield _sse({
-                    "type": "response",
-                    "reply": "\n\n".join(parts),
-                    "intent": intent,
-                    "calendar_events": saved_cal_events,
-                    "todo_items": todo_items,
-                })
+                yield _sse({"type": "response",
+                            "reply": "\n\n".join(parts),
+                            "intent": intent})
                 return
 
             # ── get_emails ──────────────────────────────────────────────────
@@ -804,8 +737,23 @@ async def chat_stream(message: dict):
             if intent in ("send_email", "meeting_and_email",
                           "create_meeting", "schedule_meeting"):
 
-                recipient = (parameters.get("recipient_email")
-                             or parameters.get("attendee_email", ""))
+                recipient = (
+                    parameters.get("recipient_email")
+                    or parameters.get("attendee_email", "")
+                )
+
+                print("ORIGINAL RECIPIENT:", recipient)
+
+                if "@" not in recipient:
+
+                    remembered_email = get_contact_email(recipient)
+
+                    print("MEMORY LOOKUP:", remembered_email)
+
+                    if remembered_email:
+                        recipient = remembered_email
+
+                print("FINAL RECIPIENT:", recipient)
 
                 if not recipient:
                     yield _sse({"type": "response",
@@ -882,26 +830,9 @@ async def chat_stream(message: dict):
                         parts.append(f"Email to {recipient} failed: "
                                      + email_result.get("error", "unknown error"))
 
-                # Auto-create calendar event for the meeting
-                meeting_date = (parameters.get("start_time") or "")[:10] or datetime.utcnow().strftime("%Y-%m-%d")
-                meeting_time = (parameters.get("start_time") or "")[11:16]
-                saved_meet_event = create_event(
-                    title=parameters.get("event_title", "Meeting"),
-                    date=meeting_date,
-                    time=meeting_time,
-                    description=f"Attendee: {recipient}\nMeet link: {meet_link or 'N/A'}",
-                    type="meeting",
-                    source="ai_meeting",
-                )
-                meet_todos = [{"text": f"Prepare for: {parameters.get('event_title', 'Meeting')}", "source": "ai_meeting"}]
-
-                yield _sse({
-                    "type": "response",
-                    "reply": "\n\n".join(parts) if parts else "Done.",
-                    "intent": intent,
-                    "calendar_events": [saved_meet_event],
-                    "todo_items": meet_todos,
-                })
+                yield _sse({"type": "response",
+                            "reply": "\n\n".join(parts) if parts else "Done.",
+                            "intent": intent})
                 return
 
             # ── fallback ────────────────────────────────────────────────────
@@ -918,34 +849,6 @@ async def chat_stream(message: dict):
     return StreamingResponse(generate(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
                                       "X-Accel-Buffering": "no"})
-
-
-@app.post("/agent/chat")
-async def agent_chat(message: dict, background_tasks: BackgroundTasks):
-    """
-    Memory-aware agent endpoint: query -> READ-ONLY LLM/MCP recall on Neo4j -> reply.
-    Durable writes happen off-path: a flush-barrier drains this session's pending
-    turns into Neo4j before answering, and a post-reply background task extracts the
-    new turn. Carries a session_id for multi-turn context. Legacy /chat is untouched.
-    """
-    try:
-        from mcp_host.agent import run_turn
-        user_text = message.get("message", "")
-        if not user_text:
-            return {"error": "message is required"}
-        session_id = message.get("session_id")
-        out = await run_turn(user_text, session_id=session_id)
-        # remember-after: extract this turn into Neo4j once the reply is sent
-        background_tasks.add_task(_drain_session_bg, out["session_id"])
-        return {
-            "reply": out["reply"],
-            "session_id": out["session_id"],
-            "tools_used": [{"tool": t["tool"], "readonly": t["readonly"]} for t in out["trace"]],
-        }
-    except Exception as e:
-        logger.error("Agent chat error: %s", e, exc_info=True)
-        return {"error": str(e), "reply": "Agent error — is Ollama running and a "
-                "tool-calling model pulled? Is Neo4j up?"}
 
 
 @app.post("/process-intent")
@@ -1039,6 +942,15 @@ async def voice(file: UploadFile = File(...)):
         model_instance = get_model()
         segments, info = model_instance.transcribe(tmp_path, language="en")
         user_text = "".join([segment.text for segment in segments]).strip()
+
+        try:
+            memory = extract_memory(user_text)
+            print("MEMORY:", memory)
+            if memory:
+                save_memory(memory)
+
+        except Exception as e:
+            logger.error(f"Memory save failed: {e}")
         
         logger.info(f"Transcribed text: {user_text}")
 
@@ -1134,25 +1046,51 @@ def vpn_test():
 @app.get("/emails/latest")
 async def get_latest_emails(max_results: int = 10):
     """Get the latest emails from inbox and sent"""
-    import asyncio
+    global email_cache
     try:
+        now = datetime.now().timestamp()
+        if (
+            email_cache["emails"]
+            and email_cache["max_results"] == max_results
+            and now - email_cache["timestamp"] < EMAIL_CACHE_SECONDS
+        ):
+            return {"success": True, "emails": email_cache["emails"], "cached": True}
+
+        if email_fetch_lock.locked():
+            return {
+                "success": True,
+                "emails": email_cache["emails"],
+                "cached": True,
+                "message": "Email fetch already in progress",
+            }
+
         client = get_gmail_client()
         if not client or not client.is_authenticated():
             return {"error": "needs_auth", "auth_url": "/auth/login", "emails": []}
 
-        loop = asyncio.get_event_loop()
-        emails = await asyncio.wait_for(
-            loop.run_in_executor(None, client.get_all_recent_emails, max_results),
-            timeout=30.0
-        )
+        async with email_fetch_lock:
+            now = datetime.now().timestamp()
+            if (
+                email_cache["emails"]
+                and email_cache["max_results"] == max_results
+                and now - email_cache["timestamp"] < EMAIL_CACHE_SECONDS
+            ):
+                return {"success": True, "emails": email_cache["emails"], "cached": True}
+
+            loop = asyncio.get_event_loop()
+            emails = await asyncio.wait_for(
+                loop.run_in_executor(None, client.get_all_recent_emails, max_results),
+                timeout=12.0
+            )
+            email_cache = {
+                "timestamp": datetime.now().timestamp(),
+                "max_results": max_results,
+                "emails": emails,
+            }
         return {"success": True, "emails": emails}
     except asyncio.TimeoutError:
-        logger.error("Email fetch timed out after 30s")
-        # Return stale cache rather than an error so the UI stays populated
-        if client and hasattr(client, "_email_cache") and client._email_cache:
-            logger.info("Serving stale email cache after timeout")
-            return {"success": True, "emails": client._email_cache, "stale": True}
-        return {"error": "Gmail request timed out", "emails": []}
+        logger.error("Email fetch timed out after 12s")
+        return {"error": "Gmail request timed out", "emails": email_cache["emails"]}
     except Exception as e:
         err = str(e)
         logger.error(f"Error fetching emails: {err}")

@@ -1,4 +1,4 @@
-
+#travel_services.py:
 import os
 import sys
 import logging
@@ -7,23 +7,21 @@ import traceback
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List
 
-from serpapi import GoogleSearch
-
 logger = logging.getLogger(__name__)
 
 
 # ── Amadeus credentials (override via .env) ─────────────────────────────────
 SERPAPI_KEY = os.getenv(
     "SERPAPI_KEY",
-    "5ab2608cd458efa6c7db985d21da7e56159f6e42084828fa5eb63deba0c4a64a"
+    ""
 )
 
 # ── Amadeus credentials (override via .env) ─────────────────────────────────
-AMADEUS_CLIENT_ID     = os.environ.get("AMADEUS_CLIENT_ID",     "GL4lMSLONHWXs0kroqnYabMGjaqzXAHR")
-AMADEUS_CLIENT_SECRET = os.environ.get("AMADEUS_CLIENT_SECRET", "CA25nHIoPpmb1ks6")
+AMADEUS_CLIENT_ID = os.environ.get("AMADEUS_CLIENT_ID", "")
+AMADEUS_CLIENT_SECRET = os.environ.get("AMADEUS_CLIENT_SECRET", "")
 
 
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+OVERPASS_URL = "https://overpass.kumi.systems/api/interpreter"
 OLLAMA_URL   = "http://localhost:11434/api/generate"
 
 IATA_CODES = {
@@ -43,11 +41,9 @@ IATA_CODES = {
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _amadeus_client():
-    print("CLIENT ID:", AMADEUS_CLIENT_ID)
-    print("CLIENT SECRET:", AMADEUS_CLIENT_SECRET[:5] + "*****")
-
+    if not AMADEUS_CLIENT_ID or not AMADEUS_CLIENT_SECRET:
+        return None
     from amadeus import Client
-
     return Client(
         client_id=AMADEUS_CLIENT_ID,
         client_secret=AMADEUS_CLIENT_SECRET
@@ -105,7 +101,10 @@ def search_flights(from_city: str, to_city: str,
         "api_key": SERPAPI_KEY,
     }
 
+    if not SERPAPI_KEY:
+        return []
     try:
+        from serpapi import GoogleSearch
         search = GoogleSearch(params)
         results = search.get_dict()
 

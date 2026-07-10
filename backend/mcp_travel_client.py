@@ -1,13 +1,22 @@
 # mcp_travel_client.py
-
 from mcp.client.session import ClientSession
 import json
+
+
+def _decode_result(result, default):
+    if getattr(result, "isError", False):
+        message = result.content[0].text if result.content else "MCP tool failed"
+        raise RuntimeError(message)
+    if not result.content:
+        return default
+    return json.loads(result.content[0].text)
 
 async def search_flights_mcp(
     session,
     from_city,
     to_city,
-    departure_date
+    departure_date,
+    return_date=None
 ):
     print(">>> search_flights_tool called <<<")
     print(from_city, to_city, departure_date)
@@ -18,16 +27,13 @@ async def search_flights_mcp(
             "from_city": from_city,
             "to_city": to_city,
             "departure_date": departure_date,
+            "return_date": return_date,
         }
     )
 
     print("MCP RESULT:", result)
 
-    if result.content:
-        print("CONTENT:", result.content[0].text)
-        return json.loads(result.content[0].text)
-
-    return []
+    return _decode_result(result, [])
 
 
 async def search_hotels_mcp(
@@ -46,10 +52,7 @@ async def search_hotels_mcp(
             "num_adults": num_adults
         }
     )
-    if result.content:
-        return json.loads(result.content[0].text)
-
-    return []
+    return _decode_result(result, [])
 
 
 async def get_attractions_mcp(
@@ -62,10 +65,7 @@ async def get_attractions_mcp(
             "city": city
         }
     )
-    if result.content:
-        return json.loads(result.content[0].text)
-
-    return []
+    return _decode_result(result, [])
 
 
 async def generate_itinerary_mcp(
@@ -91,8 +91,5 @@ async def generate_itinerary_mcp(
         }
     )
 
-    if result.content:
-        return json.loads(result.content[0].text)
-
-    return []
+    return _decode_result(result, "")
     
