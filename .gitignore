@@ -18,6 +18,10 @@ backend/token.json
 # MCP runtime state (per-user server toggles + agent-managed to-do store)
 backend/mcp_state.json
 backend/tasks_store.json
+backend/model_state.json
+
+# Research-paper metrics log (per-turn latency/success, appended by orchestration/metrics.py)
+backend/metrics/
 
 ############################
 # NODE / ELECTRON
@@ -75,3 +79,9 @@ Thumbs.db
 Docs/MCP plan.md
 Docs/Everything_for_research_paper(archi).md
 Docs/graph-schema.md
+
+
+.claude/
+PERFORMANCE_AUDIT.md
+SESSION_CHANGES_SUMMARY.md
+docs_generated/

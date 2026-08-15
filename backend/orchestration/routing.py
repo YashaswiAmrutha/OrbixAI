@@ -8,6 +8,7 @@ Three tiers:
   3. Default to general_chat
 """
 
+import os
 import re
 import logging
 from typing import Tuple
@@ -20,7 +21,11 @@ _INTENT_PATTERNS = {
     "send_email": [
         r"send\s+(?:an?\s+)?email",
         r"email\s+(?:to\s+)?[\w\-]+@[\w\-]+\.\w+",
-        r"(?:tell|write|reply)\s+(?:to\s+)?\w+",
+        # Removed: r"(?:tell|write|reply)\s+(?:to\s+)?\w+" — matched almost any
+        # sentence with "tell"/"write"/"reply" + a word, with no requirement for
+        # "email" or an address anywhere. Confirmed live: "did i tell u about the
+        # new friend..." (a pure recall question) got tagged send_email. The two
+        # patterns above already cover real send-email phrasing without this.
     ],
     "travel_planner": [
         r"plan\s+(?:a\s+)?(?:trip|travel|vacation)",
@@ -67,33 +72,46 @@ def route_query(state: OrbixState) -> OrbixState:
     """
     Route user query to the appropriate module.
 
-    Tier 1: fine-tuned IntentClassifier (LLM) — same brain the legacy /chat path
-            uses, so routing quality matches. Its full output (parameters,
-            email_content, travel_plan) is stashed in state["classification"]
-            so action_node can reuse it without a second LLM call.
-    Tier 2: regex rules as a fast fallback when the LLM is unavailable.
+    This only ever needs to decide ONE thing: travel vs. everything-else — every
+    non-travel intent maps to "chat" in _MODULE_MAP regardless of its specific
+    label (chat_node's agent loop does its own tool-selection independent of
+    this classification; state["classification"]/state["intent"] are otherwise
+    only echoed back to the frontend as a cosmetic status label — see
+    PERFORMANCE_AUDIT.md item 3). So:
+
+    Tier 1: regex rules (instant, no model call) — handles travel/email/meeting
+            phrasing directly, and anything it doesn't recognize is, by the same
+            logic, not a travel query either (the travel patterns are broad),
+            so it's safe to resolve straight to "general_chat" without escalating.
+    Tier 2: the separate fine-tuned classifier model — NOT called by default
+            anymore. Calling a second model here used to evict the agent loop's
+            already-warm llama3.1:8b context on literally every turn (confirmed:
+            ~110s of pure prompt reprocessing per turn on this CPU-only setup,
+            for a decision regex already made correctly). Kept only as an
+            explicit opt-in (ORBIX_USE_LLM_ROUTER=1) for anyone who wants the
+            extra nuance and can afford the cost.
     """
     user_query = state["user_query"]
 
-    intent = None
-    confidence = 0.0
+    # Tier 1: regex — resolves the travel-vs-chat decision for the vast majority
+    # of queries with zero LLM cost.
+    intent, confidence = _regex_route(user_query)
+    logger.info(f"Regex router → intent={intent} (confidence={confidence:.2f})")
     classification = {}
 
-    # Tier 1: LLM classifier
-    try:
-        from intent_workflow.intent_classifier import IntentClassifier
-        classification = IntentClassifier.classify(user_query) or {}
-        intent = classification.get("intent")
-        confidence = float(classification.get("confidence", 0.9) or 0.9)
-        if intent:
-            logger.info(f"LLM classifier → intent={intent} (confidence={confidence:.2f})")
-    except Exception as e:
-        logger.warning(f"LLM classifier failed ({e}); falling back to regex routing")
-
-    # Tier 2: regex fallback
-    if not intent:
-        intent, confidence = _regex_route(user_query)
-        logger.info(f"Regex router → intent={intent} (confidence={confidence:.2f})")
+    # Tier 2 (opt-in only): consult the fine-tuned classifier for extra nuance.
+    # Off by default — see docstring above for why.
+    if os.environ.get("ORBIX_USE_LLM_ROUTER") == "1":
+        try:
+            from intent_workflow.intent_classifier import IntentClassifier
+            classification = IntentClassifier.classify(user_query) or {}
+            llm_intent = classification.get("intent")
+            if llm_intent:
+                intent = llm_intent
+                confidence = float(classification.get("confidence", 0.9) or 0.9)
+                logger.info(f"LLM classifier → intent={intent} (confidence={confidence:.2f})")
+        except Exception as e:
+            logger.warning(f"LLM classifier failed ({e}); keeping regex result")
 
     # The MCP agent reads the raw user query and decides which tools to call, so no
     # param normalization / intent-upgrade is needed here anymore — routing only picks

@@ -1,0 +1,48 @@
+# Container dependency set for the OrbixAI backend.
+#
+# Versions are pinned to the versions proven working on the development host, so a
+# rebuilt image reproduces the environment the results were measured in — a
+# requirement for publishing reproducible benchmarks.
+#
+# Two deliberate differences from the host requirements.txt:
+#
+#  1. sounddevice / pyttsx3 / scipy are OMITTED. They are imported only by the
+#     standalone voice/stt.py and voice/tts.py helpers and need real audio hardware
+#     (PortAudio / SAPI) that a container has no access to. The served app does
+#     speech-to-text with faster-whisper in-process and text-to-speech in the
+#     browser, so nothing in the running system imports them.
+#
+#  2. langchain is OMITTED. A repo-wide search finds no `import langchain` anywhere;
+#     only langgraph is actually used. It was also an active problem: langchain
+#     constrains numpy<2 on Python 3.11, which conflicts with the numpy>=2 the rest
+#     of the stack runs on and made the image unbuildable.
+
+fastapi==0.136.3
+uvicorn[standard]==0.49.0
+python-multipart==0.0.32
+
+faster-whisper==1.2.1
+requests==2.34.2
+numpy==2.4.6
+
+ollama==0.6.2
+neo4j==6.1.0
+
+google-auth-oauthlib==1.4.0
+google-auth-httplib2==0.4.0
+google-api-python-client==2.197.0
+
+python-dotenv==1.1.1
+PyYAML==6.0.3
+beautifulsoup4==4.12.2
+
+mcp==1.22.0
+langgraph==1.2.4
+
+# Travel integrations. NOT installed on the host — `import serpapi` currently fails
+# there, which makes google_service/travel_services.py unimportable and takes the
+# whole travel-planning branch down. Including them here means the container is the
+# first environment where that path can actually run. `google-search-results` is the
+# distribution that provides the `serpapi` module.
+amadeus==12.0.0
+google-search-results==2.4.2

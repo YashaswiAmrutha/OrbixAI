@@ -418,6 +418,14 @@ def enabled_server_specs() -> dict[str, dict]:
         if not state["enabled"].get(sid, s["default"]):
             continue
         env = dict(os.environ)
+        # Force UTF-8 stdio — a Windows subprocess otherwise inherits the console's
+        # default (non-UTF-8) codepage, and any server printing non-ASCII content
+        # (a name, a search result, a file path) can crash outright with
+        # UnicodeEncodeError instead of just mis-displaying it. Confirmed live for
+        # the travel subprocess (google_service/travel_planner.py has the same fix);
+        # applying it here too since any of these servers could hit the same class
+        # of bug with the right input.
+        env["PYTHONIOENCODING"] = "utf-8"
         env.update(_env_for(sid, state["config"].get(sid, {})))
         specs[sid] = {"command": s["command"], "args": list(s["args"]), "env": env}
     return specs

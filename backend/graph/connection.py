@@ -47,11 +47,25 @@ def _cfg() -> tuple[str, str, str]:
     return uri, user, pwd
 
 
+# Fail-fast timeouts. The driver's defaults (30s connection timeout, 30s transaction
+# retry window) mean an unreachable Neo4j costs ~45s per call before raising — and
+# since every agent turn pre-loads recall('user:self'), a stopped database turned
+# each turn into a 45s stall that then answered with no memory at all. Memory is
+# meant to degrade gracefully, so surface the outage in seconds instead.
+_CONNECT_TIMEOUT_S = float(os.environ.get("ORBIX_NEO4J_CONNECT_TIMEOUT_S", "5"))
+_RETRY_WINDOW_S = float(os.environ.get("ORBIX_NEO4J_RETRY_TIME_S", "5"))
+
+
 @lru_cache(maxsize=1)
 def get_driver() -> Driver:
     """Return a cached singleton Neo4j driver."""
     uri, user, pwd = _cfg()
-    driver = GraphDatabase.driver(uri, auth=(user, pwd))
+    driver = GraphDatabase.driver(
+        uri,
+        auth=(user, pwd),
+        connection_timeout=_CONNECT_TIMEOUT_S,
+        max_transaction_retry_time=_RETRY_WINDOW_S,
+    )
     logger.info("Neo4j driver created for %s", uri)
     return driver
 

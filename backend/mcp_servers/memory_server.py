@@ -10,6 +10,8 @@ hints so the host can confirm-gate writes (architecture §7.2-§7.4).
 
 Tools
   read  (readOnlyHint):  recall · search · get_entity · get_fact · fact_history
+                          search_transcript (raw SQLite session history, not a
+                          graph fact — see its docstring)
   write (not readOnly) :  remember_fact · correct · upsert_entity · link
                           remember_episode · forget
 
@@ -35,6 +37,13 @@ _GRAPH_DIR = Path(__file__).resolve().parents[1] / "graph"
 sys.path.insert(0, str(_GRAPH_DIR))
 
 import memory as mem  # type: ignore  # noqa: E402
+import working_memory as wm  # type: ignore  # noqa: E402
+
+# This server is spawned as its own OS subprocess (stdio transport), so it never
+# shares the main backend's in-process init — but session.db is the same on-disk
+# SQLite file, and init_db()'s CREATE TABLE IF NOT EXISTS is safe to call again
+# from here (idempotent, WAL mode tolerates the concurrent access).
+wm.init_db()
 
 from mcp.server.fastmcp import FastMCP  # noqa: E402
 from mcp.types import ToolAnnotations  # noqa: E402
@@ -102,6 +111,20 @@ def fact_history(subject_key: str, predicate: str) -> dict:
     """The 'what did I used to...' read: current value plus archived past values.
     Only use when the user explicitly asks about the past."""
     return mem.fact_history(subject_key, predicate)
+
+
+@mcp.tool(annotations=_READONLY)
+def search_transcript(query: str, session_id: str, limit: int = 5) -> list[dict]:
+    """
+    Keyword search over THIS conversation's older messages — ones that have
+    already scrolled out of your visible context window. Returns raw quotes
+    ({role, text, ts}), NOT verified facts: present them as "earlier in this chat
+    you/I said X," never as ground truth (use recall/search for that). Only call
+    this for something specific you can't find in the visible transcript above or
+    in "WHAT YOU ALREADY KNOW". The host fills in session_id automatically —
+    pass through whatever value you were given for it unchanged.
+    """
+    return wm.search_messages(session_id, query, limit=limit)
 
 
 # --------------------------------------------------------------------------- #

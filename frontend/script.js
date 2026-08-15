@@ -31,6 +31,8 @@ const micBtn         = document.getElementById("mic-btn");
 const voiceMuteBtn   = document.getElementById("voice-mute-btn");
 const themeToggleBtn = document.getElementById("theme-toggle");
 
+const newChatBtn     = document.getElementById("new-chat-btn");
+
 const mailContainer = document.getElementById("mail-container");
 const mailList      = document.getElementById("mail-list");
 const mailRefreshBtn = document.getElementById("mail-refresh-btn");
@@ -161,13 +163,13 @@ function showThinking() {
   const wrapper = document.createElement("div");
   wrapper.className = "message-wrapper assistant thinking-wrapper";
   wrapper.innerHTML = `
-    <div class="thinking-bubble" id="thinking-bubble">
+    <div class="thinking-bubble">
       <div class="thinking-header" onclick="this.closest('.thinking-bubble').classList.toggle('collapsed')">
         <span class="thinking-spinner"></span>
         <span class="thinking-label">Thinking…</span>
         <svg class="thinking-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
       </div>
-      <div class="thinking-steps" id="thinking-steps"></div>
+      <div class="thinking-steps"></div>
     </div>`;
   chatContainer.appendChild(wrapper);
   _thinkingEl = wrapper;
@@ -176,7 +178,14 @@ function showThinking() {
 }
 
 function addThinkingStep(step) {
-  const steps = document.getElementById("thinking-steps");
+  // Scoped to the CURRENT turn's bubble, not a global id lookup — every turn's
+  // bubble used to share the same id="thinking-steps", and collapseThinking()
+  // correctly leaves finished bubbles in the chat log (it doesn't remove them),
+  // so document.getElementById always returned the FIRST (oldest) bubble's
+  // container. Every later turn's steps were silently appended into that first
+  // bubble instead of their own.
+  if (!_thinkingEl) return;
+  const steps = _thinkingEl.querySelector(".thinking-steps");
   if (!steps) return;
   const div = document.createElement("div");
   div.className = "thinking-step";
@@ -513,6 +522,29 @@ function closeMailModal() {
 
 function toggleMailWidget() {
   if (mailContainer) mailContainer.classList.toggle("collapsed");
+}
+
+// ── Panel collapse (left calendar/today panel, right mail/todo panel) ─────────
+function initPanelToggles() {
+  const shell     = document.getElementById("app-shell");
+  const leftBtn   = document.getElementById("left-panel-toggle");
+  const rightBtn  = document.getElementById("right-panel-toggle");
+  if (!shell) return;
+
+  function applyState(side, collapsed) {
+    shell.classList.toggle(`${side}-collapsed`, collapsed);
+    const btn = side === "left" ? leftBtn : rightBtn;
+    if (btn) btn.setAttribute("aria-expanded", String(!collapsed));
+    localStorage.setItem(`orbix-${side}-panel-collapsed`, collapsed ? "1" : "0");
+  }
+
+  const leftCollapsed  = localStorage.getItem("orbix-left-panel-collapsed") === "1";
+  const rightCollapsed = localStorage.getItem("orbix-right-panel-collapsed") === "1";
+  applyState("left", leftCollapsed);
+  applyState("right", rightCollapsed);
+
+  if (leftBtn)  leftBtn.addEventListener("click", () => applyState("left", !shell.classList.contains("left-collapsed")));
+  if (rightBtn) rightBtn.addEventListener("click", () => applyState("right", !shell.classList.contains("right-collapsed")));
 }
 
 async function handleMailSubmit(e) {
@@ -1019,31 +1051,51 @@ function saveTodos() {
   localStorage.setItem("orbix-todos", JSON.stringify(todos));
 }
 
+function todoSourceBadge(source) {
+  if (source === "ai_travel")  return `<span class="todo-source-badge travel">Travel</span>`;
+  if (source === "ai_meeting") return `<span class="todo-source-badge meeting">Meeting</span>`;
+  return "";
+}
+
+function todoItemHtml(t, idx) {
+  return `<div class="todo-item${t.done ? " is-done" : ""}" role="listitem">
+    <div class="todo-check ${t.done ? "done" : ""}" data-idx="${idx}" role="checkbox" aria-checked="${t.done}" tabindex="0" aria-label="Toggle task completion"></div>
+    <span class="todo-text ${t.done ? "done" : ""}">${escapeHtml(t.text)}</span>
+    ${todoSourceBadge(t.source)}
+    <button class="todo-del-btn" data-idx="${idx}" aria-label="Delete task">✕</button>
+  </div>`;
+}
+
 function renderTodos() {
   const list    = document.getElementById("todo-list");
   const countEl = document.getElementById("todo-count");
   if (!list) return;
 
-  const pending = todos.filter(t => !t.done).length;
-  if (countEl) countEl.textContent = pending;
+  const withIdx  = todos.map((t, i) => ({ ...t, _idx: i }));
+  const active   = withIdx.filter(t => !t.done);
+  const done     = withIdx.filter(t => t.done);
+
+  if (countEl) countEl.textContent = active.length;
 
   if (todos.length === 0) {
-    list.innerHTML = `<div class="todo-empty">No tasks yet</div>`;
+    list.innerHTML = `<div class="todo-empty">No tasks yet — add one above, or ask the assistant to plan something for you.</div>`;
     return;
   }
 
-  list.innerHTML = todos.map((t, i) => {
-    let badge = "";
-    if (t.source === "ai_travel")  badge = `<span class="todo-source-badge travel">Travel</span>`;
-    else if (t.source === "ai_meeting") badge = `<span class="todo-source-badge meeting">Meeting</span>`;
+  let html = "";
+  html += active.length
+    ? active.map(t => todoItemHtml(t, t._idx)).join("")
+    : `<div class="todo-empty todo-empty-inline">All caught up 🎉</div>`;
 
-    return `<div class="todo-item" role="listitem">
-      <div class="todo-check ${t.done ? "done" : ""}" data-idx="${i}" role="checkbox" aria-checked="${t.done}" tabindex="0" aria-label="Toggle task completion"></div>
-      <span class="todo-text ${t.done ? "done" : ""}">${escapeHtml(t.text)}</span>
-      ${badge}
-      <button class="todo-del-btn" data-idx="${i}" aria-label="Delete task">✕</button>
+  if (done.length) {
+    html += `<div class="todo-divider">
+      <span>Completed · ${done.length}</span>
+      <button class="todo-clear-btn" id="todo-clear-done" type="button">Clear</button>
     </div>`;
-  }).join("");
+    html += done.map(t => todoItemHtml(t, t._idx)).join("");
+  }
+
+  list.innerHTML = html;
 
   list.querySelectorAll(".todo-check").forEach(el => {
     const toggle = () => {
@@ -1061,6 +1113,14 @@ function renderTodos() {
       renderTodos();
     });
   });
+  const clearBtn = document.getElementById("todo-clear-done");
+  if (clearBtn) {
+    clearBtn.addEventListener("click", () => {
+      todos = todos.filter(t => !t.done);
+      saveTodos();
+      renderTodos();
+    });
+  }
 }
 
 // Auto-add AI-generated todo items (called from stream response handler)
@@ -1168,6 +1228,24 @@ function showWelcomeHero() {
     <div class="welcome-chips">${chips}</div>`;
   chatContainer.appendChild(hero);
 }
+
+// Start a brand-new conversation: mint a fresh session_id and clear the visible
+// chat. The old session's transcript isn't deleted — it just becomes unused
+// (the existing 24h expiry cleanup handles it) — this only needs to change what
+// session_id future messages use. Without this, a session accumulates forever;
+// a long, topically-mixed transcript was observed causing the model to answer
+// a brand-new question ("who am i?") by regurgitating a much earlier exchange
+// instead of the current one — a real local-model context-tracking limit that
+// giving the user an easy way to start fresh sidesteps entirely.
+function startNewChat() {
+  chatSessionId = (window.crypto && crypto.randomUUID) ? crypto.randomUUID()
+      : "s-" + Date.now() + "-" + Math.random().toString(36).slice(2);
+  localStorage.setItem("orbix-session", chatSessionId);
+  if (chatContainer) chatContainer.innerHTML = "";
+  showWelcomeHero();
+  if (userInput) { userInput.value = ""; userInput.focus(); }
+}
+if (newChatBtn) newChatBtn.addEventListener("click", startNewChat);
 
 // ── Today agenda (driven by calendar events) ────────────────────────────────────
 function renderTodayAgenda() {
@@ -1483,6 +1561,33 @@ async function initMcp() {
   await loadMcpServers();
 }
 
+// ── Active model toggle (research comparison: base vs. fine-tuned) ─────────────
+async function initModelSelect() {
+  const sel = document.getElementById("model-select");
+  if (!sel) return;
+  try {
+    const { models } = await (await fetch(`${API_BASE}/model/list`)).json();
+    sel.innerHTML = (models || [])
+      .map(m => `<option value="${m.id}" ${m.active ? "selected" : ""}>${m.label || m.id}</option>`)
+      .join("");
+  } catch (_) { /* backend not up yet — leave the select empty */ }
+
+  sel.addEventListener("change", async () => {
+    const model = sel.value;
+    try {
+      await fetch(`${API_BASE}/model/active`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model }),
+      });
+      // Ollama loads/unloads models per-request — no restart needed, just let
+      // the user know the swap is live for the next message (no toast helper
+      // in this app yet, so a console note is the honest minimum here).
+      console.info(`Switched active model to ${sel.options[sel.selectedIndex].text}`);
+    } catch (_) { /* leave selection as-is; next turn will just use the old model */ }
+  });
+}
+
 // ── App Init ──────────────────────────────────────────────────────────────────
 window.addEventListener("load", () => {
   initializeTheme();
@@ -1490,7 +1595,9 @@ window.addEventListener("load", () => {
   loadUserName();
   if (userInput) userInput.focus();
   showWelcomeHero();
+  initPanelToggles();
   initMcp();
+  initModelSelect();
   startEmailAutoRefresh();
   startHealthCheck();
   initCalendar();
