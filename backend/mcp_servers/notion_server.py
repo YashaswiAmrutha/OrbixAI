@@ -58,7 +58,14 @@ def _title_of(obj: dict) -> str:
 
 @mcp.tool(annotations=_READONLY)
 def notion_search(query: str, limit: int = 8) -> dict:
-    """Search pages/databases shared with the integration. Returns {results:[{id,title,type,url}]}."""
+    """
+    Search pages/databases shared with the integration. Returns
+    {results:[{id,title,type,url}]}. Each result's `url` is the actual clickable
+    Notion link — when you tell the user about a page, include its real url
+    value in your reply (e.g. "OrbixAI — https://notion.so/..."). Never say
+    "click the respective URLs" or similar without actually stating them; the
+    user can't click a link you didn't write out.
+    """
     h = _headers()
     if h is None:
         return _NO_TOKEN
@@ -73,7 +80,22 @@ def notion_search(query: str, limit: int = 8) -> dict:
         return {"error": f"request failed: {e}"}
     out = [{"id": o["id"], "title": _title_of(o), "type": o.get("object"),
             "url": o.get("url", "")} for o in data.get("results", [])]
-    return {"results": out, "count": len(out)}
+    result = {"results": out, "count": len(out)}
+    if not out:
+        # Notion's Search API only ever returns pages/databases EXPLICITLY shared
+        # with this integration (via a page's "..." -> "Connect to" menu) — a
+        # valid token grants zero access on its own. A bare {results: [], count: 0}
+        # reads to the model (and then the user) as "you have no pages," which is
+        # misleading in the common case where pages exist but were never shared.
+        # This hint travels with the result so the model can explain the real
+        # reason instead of asserting the workspace is empty.
+        result["hint"] = ("No results — in Notion, an integration only sees pages "
+                          "that have been explicitly shared with it (open the page "
+                          "-> '...' menu -> 'Connect to' -> select this integration). "
+                          "This is a Notion access-control requirement, not proof the "
+                          "workspace is actually empty — tell the user to share the "
+                          "relevant pages with the integration if they expected results.")
+    return result
 
 
 @mcp.tool(annotations=_READONLY)

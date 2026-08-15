@@ -18,6 +18,7 @@ Run (stdio transport):
 
 import os
 import string
+import time
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -52,6 +53,25 @@ _BLOCKED_ABS = [
     r"c:\recovery",
 ]
 _MAX_READ = 200_000  # bytes
+# Wall-clock budget for a single search_files call. Roots default to every fixed
+# drive, so an unbudgeted walk is effectively unbounded; partial results returned
+# promptly beat a complete answer that never arrives.
+_SEARCH_BUDGET_S = float(os.environ.get("ORBIX_FILES_SEARCH_BUDGET_S", "20"))
+
+# Machine-generated dependency/cache trees. These are never what someone means by
+# "find my file", but they contain enormous numbers of files — a whole-drive search
+# spent its entire budget inside IDE typeshed stubs and npm caches and returned those
+# instead of the user's own project file. Skipping them is both a relevance fix and a
+# speed fix; matched by exact directory name at any depth.
+_NOISE_DIRS = {
+    "node_modules", "__pycache__", ".git", ".hg", ".svn", ".cache", ".venv", "venv",
+    "site-packages", "dist-info", ".gradle", ".m2", ".nuget", ".cargo", ".rustup",
+    ".npm", ".yarn", ".pnpm-store", ".next", ".nuxt", ".parcel-cache", ".pytest_cache",
+    ".mypy_cache", ".ruff_cache", ".tox", ".ipynb_checkpoints", ".terraform",
+    ".vscode", ".vscode-server", ".cursor", ".idea", ".eclipse", ".android",
+    ".nvm", ".pyenv", ".conda", "anaconda3", "miniconda3", "appdata",
+    "windowsapps", "packagecache", "onedrivetemp",
+}
 
 
 def _default_roots() -> list[Path]:
@@ -132,7 +152,11 @@ def list_allowed_roots() -> dict:
 def list_directory(path: str) -> dict:
     """
     List the entries in a directory inside an allowed folder. Returns
-    {path, entries: [{name, type, size}]}. `type` is 'dir' or 'file'.
+    {path, entries: [{name, type, size}]}. `type` is 'dir' or 'file'. Capped
+    at 200 entries (truncated: true if there's more) — same reasoning as
+    recall()'s cap: an unbounded listing (e.g. a whole drive root when no
+    specific folder is configured) was found to overwhelm a small local model
+    with raw data instead of answering the actual question.
     """
     rp, err = _resolve(path)
     if err:
@@ -140,8 +164,12 @@ def list_directory(path: str) -> dict:
     if not rp.is_dir():
         return {"error": f"{rp} is not a directory"}
     entries = []
+    truncated = False
     try:
         for child in sorted(rp.iterdir()):
+            if len(entries) >= 200:
+                truncated = True
+                break
             try:
                 entries.append({
                     "name": child.name,
@@ -152,7 +180,10 @@ def list_directory(path: str) -> dict:
                 continue
     except Exception as e:  # noqa: BLE001
         return {"error": f"could not list {rp}: {e}"}
-    return {"path": str(rp), "entries": entries, "count": len(entries)}
+    result = {"path": str(rp), "entries": entries, "count": len(entries)}
+    if truncated:
+        result["truncated"] = True
+    return result
 
 
 @mcp.tool(annotations=_READONLY)
@@ -197,20 +228,45 @@ def search_files(query: str, root: str = "") -> dict:
         if not search_roots:
             return {"error": "No allowed folders configured."}
     matches: list[str] = []
+    deadline = time.monotonic() + _SEARCH_BUDGET_S
+    timed_out = False
     for base in search_roots:
+        if timed_out:
+            break
         try:
             for dirpath, dirnames, filenames in os.walk(base):
-                # prune blocked dirs
-                dirnames[:] = [d for d in dirnames if d.lower() not in _BLOCKED_PARTS]
+                # Prune by FULL PATH, not just by bare directory name. The name-only
+                # check missed every _BLOCKED_ABS location (C:\Windows, Program Files,
+                # ProgramData, $Recycle.Bin), so a default whole-drive root walked all
+                # of Windows before reaching user data — confirmed live as a >60s hang.
+                dirnames[:] = [
+                    d for d in dirnames
+                    if d.lower() not in _BLOCKED_PARTS
+                    and d.lower() not in _NOISE_DIRS
+                    and not _is_blocked(Path(dirpath) / d)
+                ]
                 for fn in filenames:
                     if q in fn.lower():
                         matches.append(str(Path(dirpath) / fn))
                         if len(matches) >= 100:
                             return {"matches": matches, "count": len(matches),
                                     "truncated": True}
+                # A name search over an allowed root can be unbounded (roots default to
+                # every fixed drive). Bound it by wall-clock so the tool always answers
+                # within the caller's timeout instead of blocking the whole agent turn.
+                if time.monotonic() > deadline:
+                    timed_out = True
+                    break
         except Exception:  # noqa: BLE001
             continue
-    return {"matches": matches, "count": len(matches)}
+    out = {"matches": matches, "count": len(matches)}
+    if timed_out:
+        out["truncated"] = True
+        out["note"] = (
+            f"Search stopped after {_SEARCH_BUDGET_S}s across very large roots; these "
+            "are partial results. Pass `root` to narrow the search to one folder."
+        )
+    return out
 
 
 @mcp.tool(annotations=_ACTION)

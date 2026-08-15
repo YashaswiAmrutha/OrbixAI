@@ -173,21 +173,35 @@ class GmailClient:
                 self.service = None
                 raise Exception("needs_auth")
 
-    def get_all_recent_emails(self, max_results=10):
+    def get_all_recent_emails(self, max_results=10, query: str = ""):
         """
         Fetch inbox + sent emails using direct REST calls (requests library) for
         parallel fetches — avoids httplib2 SSL corruption under concurrent threads.
+
+        `query` is Gmail's native search syntax (from:, subject:, has:attachment,
+        after:, etc. — https://support.google.com/mail/answer/7190), ANDed onto the
+        in:inbox/in:sent scoping. Without this, the only way to find a specific
+        email was "list the N most recent and hope it's in there" — confirmed live:
+        asked to act on "the zoomin mail," the model could only pull 1 most-recent
+        result (an unrelated newsletter) and had no way to actually search for it.
+        Query results are never cached (see below) — the shared cache is only valid
+        for the plain "most recent" case where every caller wants the same thing.
         """
         import requests as _req
         from email.utils import parsedate_to_datetime
 
-        # ── 1. Return cached result if still fresh ───────────────────────────
-        with self._email_cache_lock:
-            if (self._email_cache is not None and
-                    self._email_cache_time is not None and
-                    (datetime.utcnow() - self._email_cache_time).total_seconds() < _EMAIL_CACHE_TTL):
-                logger.info("Returning cached emails (cache hit)")
-                return self._email_cache
+        query = (query or "").strip()
+
+        # ── 1. Return cached result if still fresh (unfiltered calls only —
+        #      a query result would otherwise pollute/be served from a cache key
+        #      that has nothing to do with what was actually asked for) ────────
+        if not query:
+            with self._email_cache_lock:
+                if (self._email_cache is not None and
+                        self._email_cache_time is not None and
+                        (datetime.utcnow() - self._email_cache_time).total_seconds() < _EMAIL_CACHE_TTL):
+                    logger.info("Returning cached emails (cache hit)")
+                    return self._email_cache
 
         try:
             self._ensure_fresh_credentials()
@@ -204,11 +218,26 @@ class GmailClient:
                                         "fields": "messages/id"},
                                 timeout=10)
                 resp.raise_for_status()
-                return resp.json().get("messages", [])
+                # A `fields` projection that selects nothing leaves Gmail returning
+                # HTTP 200 with a COMPLETELY EMPTY body, not "{}" — so .json() raises
+                # "Expecting value: line 1 column 1 (char 0)". That happens whenever a
+                # search matches nothing in one of the two folders, which is the normal
+                # case for any narrow query (e.g. "from:github" has no sent mail), and
+                # it took down the entire call including the folder that DID match.
+                # Zero results is a valid outcome, not an error.
+                if not resp.content or not resp.content.strip():
+                    return []
+                try:
+                    return resp.json().get("messages", []) or []
+                except ValueError:
+                    logger.warning("Gmail list returned non-JSON body for q=%r", q)
+                    return []
 
+            inbox_q = f"in:inbox {query}".strip()
+            sent_q  = f"in:sent {query}".strip()
             with ThreadPoolExecutor(max_workers=2) as pool:
-                inbox_f = pool.submit(list_folder, "in:inbox")
-                sent_f  = pool.submit(list_folder, "in:sent")
+                inbox_f = pool.submit(list_folder, inbox_q)
+                sent_f  = pool.submit(list_folder, sent_q)
                 inbox_ids = inbox_f.result()
                 sent_ids  = sent_f.result()
 
@@ -276,19 +305,23 @@ class GmailClient:
             )
             final = all_emails[:max_results * 2]
 
-            # ── 5. Update cache ──────────────────────────────────────────────
-            with self._email_cache_lock:
-                self._email_cache      = final
-                self._email_cache_time = datetime.utcnow()
-            logger.info(f"Email fetch complete: {len(final)} emails cached")
+            # ── 5. Update cache (unfiltered calls only — see docstring) ──────
+            if not query:
+                with self._email_cache_lock:
+                    self._email_cache      = final
+                    self._email_cache_time = datetime.utcnow()
+                logger.info(f"Email fetch complete: {len(final)} emails cached")
+            else:
+                logger.info(f"Email search '{query}' complete: {len(final)} emails")
             return final
 
         except Exception as error:
             logger.error(f"Error fetching emails: {error}")
-            with self._email_cache_lock:
-                if self._email_cache is not None:
-                    logger.info("Returning stale cache due to fetch error")
-                    return self._email_cache
+            if not query:
+                with self._email_cache_lock:
+                    if self._email_cache is not None:
+                        logger.info("Returning stale cache due to fetch error")
+                        return self._email_cache
             raise
 
     def send_email(self, to_email, subject, body, html_body=None):

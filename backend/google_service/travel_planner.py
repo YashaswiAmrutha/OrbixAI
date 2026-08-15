@@ -46,22 +46,30 @@ OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 # 1. ENTITY EXTRACTION  (llama-3-13k → Ollama fallback)
 # ═══════════════════════════════════════════════════════════════════════════
 
-EXTRACTION_PROMPT = """You are a travel information extraction assistant.
+def _extraction_prompt() -> str:
+    # Today's date must be given explicitly — without it the model has no
+    # anchor for relative phrases ("next month", "next week", "tomorrow") and
+    # was observed hallucinating an unrelated fixed date (e.g. 2024-02-01) for
+    # "next month next month", which then propagated into wrong calendar events.
+    today = datetime.now().strftime("%Y-%m-%d (%A)")
+    return f"""You are a travel information extraction assistant.
+Today's date is {today}. Resolve any relative date ("next month", "next week",
+"tomorrow") against this date.
 Extract ONLY the following fields from the query and return strict JSON.
 Use null for missing values.
 
 Required JSON shape:
-{
+{{
   "from_city": "CityName or null",
   "to_city": "CityName or null",
   "check_in": "YYYY-MM-DD or null",
   "check_out": "YYYY-MM-DD or null",
   "num_nights": integer_or_null,
   "num_adults": integer_or_null
-}
+}}
 
 Rules:
-- Convert natural dates ("27 jan 2026") to YYYY-MM-DD
+- Convert natural dates ("27 jan 2026") to YYYY-MM-DD using today's date above as the reference point
 - "X days" → num_nights = X
 - Default num_adults to 1 if not mentioned
 - Return ONLY the JSON object, no prose
@@ -109,12 +117,17 @@ def extract_travel_entities(query: str, emit=None) -> Dict:
             emit(msg)
 
     _emit("Extracting travel details…")
-    model = os.environ.get("ORBIX_TRAVEL_MODEL", "llama3.2:3b")
+    # "llama3.2:3b" is not a locally-pulled tag on this machine (`ollama list`
+    # only has llama3.2:latest) — that silently broke this call every time
+    # (caught below, returning empty entities), which is why travel queries with
+    # a perfectly clear destination were failing with "could not determine
+    # destination". llama3.1:8b is confirmed present and used elsewhere.
+    model = os.environ.get("ORBIX_TRAVEL_MODEL", "llama3.1:8b")
     try:
         resp = ollama.chat(
             model=model,
             messages=[
-                {"role": "system", "content": EXTRACTION_PROMPT.rstrip().rstrip("Query:").rstrip()},
+                {"role": "system", "content": _extraction_prompt().rstrip().rstrip("Query:").rstrip()},
                 {"role": "user", "content": query},
             ],
             format=_TRAVEL_SCHEMA,
@@ -209,10 +222,20 @@ async def plan_trip(query: str, emit: Callable[[str], None] = None) -> Dict:
     # machine/OS (was previously hardcoded to a teammate's macOS Downloads folder).
     _backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     _server_script = os.path.join(_backend_dir, "mcp_travel_server.py")
+    # Force UTF-8 stdio on the subprocess — confirmed live crash: an attraction name
+    # in Devanagari script (from the Overpass API) hit a debug print() in the travel
+    # subprocess, which on Windows inherits the console's default (non-UTF-8) codepage
+    # and raised UnicodeEncodeError, killing the whole trip-planning TaskGroup for a
+    # destination that otherwise would have worked fine. Without this, this failure
+    # is destination-dependent and intermittent (only place names outside the console
+    # codepage trigger it).
+    _env = dict(os.environ)
+    _env["PYTHONIOENCODING"] = "utf-8"
     server_params = StdioServerParameters(
         command=sys.executable,
         args=[_server_script],
         cwd=_backend_dir,  # so the subprocess can import google_service.* / mcp_travel_client
+        env=_env,
     )
 
     async with stdio_client(server_params) as (read_stream, write_stream):

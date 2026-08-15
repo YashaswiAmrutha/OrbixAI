@@ -81,8 +81,10 @@ class MemoryIntegration:
                 # 1. Create Trip node
                 session.run(
                     """
-                    MERGE (t:Trip {id: $trip_id})
-                    ON CREATE SET 
+                    MERGE (t:Trip:Entity {id: $trip_id})
+                    ON CREATE SET
+                        t.key = $trip_id,
+                        t.name = $to_city,
                         t.from_city = $from_city,
                         t.to_city = $to_city,
                         t.check_in = $check_in,
@@ -112,8 +114,9 @@ class MemoryIntegration:
                 to_city = trip_data.get("to_city")
                 session.run(
                     """
-                    MERGE (loc:Location {name: $city, type: 'city'})
-                    ON CREATE SET 
+                    MERGE (loc:Location:Entity {name: $city, type: 'city'})
+                    ON CREATE SET
+                        loc.key = 'location:' + toLower($city),
                         loc.country = $country,
                         loc.created_at = datetime()
                     WITH loc

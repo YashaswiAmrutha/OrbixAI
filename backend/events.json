@@ -12,138 +12,6 @@
       "created_at": "2026-06-19T12:26:22.202627"
     },
     {
-      "id": "57d8fb60-6930-4bbb-8198-1f8b550c99f2",
-      "title": "Day 1: Historical Sites and Beach Time**",
-      "date": "2026-01-27",
-      "time": "",
-      "description": "Trip to Goa",
-      "type": "travel",
-      "source": "ai_travel",
-      "color": "#22c55e",
-      "created_at": "2026-07-02T17:44:04.428314"
-    },
-    {
-      "id": "7dd76cff-28d2-4813-bcbe-3958f737f38f",
-      "title": "Day 2: Museums and Waterfalls**",
-      "date": "2026-01-28",
-      "time": "",
-      "description": "Trip to Goa",
-      "type": "travel",
-      "source": "ai_travel",
-      "color": "#22c55e",
-      "created_at": "2026-07-02T17:44:04.438943"
-    },
-    {
-      "id": "f190bbe4-60ec-4a20-83a4-b31f3aa6de3e",
-      "title": "Day 3: Forts and Caves**",
-      "date": "2026-01-29",
-      "time": "",
-      "description": "Trip to Goa",
-      "type": "travel",
-      "source": "ai_travel",
-      "color": "#22c55e",
-      "created_at": "2026-07-02T17:44:04.448885"
-    },
-    {
-      "id": "cb015d33-16bc-4764-afdf-3f81e20d6f0c",
-      "title": "Day 1: Historical Sites and Beach Relaxation**",
-      "date": "2026-07-07",
-      "time": "",
-      "description": "Trip to Goa",
-      "type": "travel",
-      "source": "ai_travel",
-      "color": "#22c55e",
-      "created_at": "2026-07-07T07:05:47.643840"
-    },
-    {
-      "id": "88db0b12-4f95-450b-bd02-c172d96908a0",
-      "title": "Day 2: Forts and Caves**",
-      "date": "2026-07-08",
-      "time": "",
-      "description": "Trip to Goa",
-      "type": "travel",
-      "source": "ai_travel",
-      "color": "#22c55e",
-      "created_at": "2026-07-07T07:05:47.658784"
-    },
-    {
-      "id": "ecee6bff-9420-44b9-a8cb-8920961b52c2",
-      "title": "Day 3: Museums and Waterfalls**",
-      "date": "2026-07-09",
-      "time": "",
-      "description": "Trip to Goa",
-      "type": "travel",
-      "source": "ai_travel",
-      "color": "#22c55e",
-      "created_at": "2026-07-07T07:05:47.669156"
-    },
-    {
-      "id": "a140cfe1-1208-44c5-9510-d52f5b6406f4",
-      "title": "Day 1: July 7th, 2026**",
-      "date": "2026-07-07",
-      "time": "",
-      "description": "Trip to Goa",
-      "type": "travel",
-      "source": "ai_travel",
-      "color": "#22c55e",
-      "created_at": "2026-07-07T07:11:30.487999"
-    },
-    {
-      "id": "f1a7950f-ae2b-4bea-8e61-18ee76474283",
-      "title": "Day 1: Travel Tips:**",
-      "date": "2026-07-07",
-      "time": "",
-      "description": "Trip to Goa",
-      "type": "travel",
-      "source": "ai_travel",
-      "color": "#22c55e",
-      "created_at": "2026-07-07T07:11:30.498679"
-    },
-    {
-      "id": "34aced4d-4199-446d-ab60-f4e287e369e7",
-      "title": "Day 2: July 8th, 2026**",
-      "date": "2026-07-08",
-      "time": "",
-      "description": "Trip to Goa",
-      "type": "travel",
-      "source": "ai_travel",
-      "color": "#22c55e",
-      "created_at": "2026-07-07T07:11:30.508156"
-    },
-    {
-      "id": "8b6c4184-279b-4771-890a-c961de6368c2",
-      "title": "Day 2: Travel Tips:**",
-      "date": "2026-07-08",
-      "time": "",
-      "description": "Trip to Goa",
-      "type": "travel",
-      "source": "ai_travel",
-      "color": "#22c55e",
-      "created_at": "2026-07-07T07:11:30.518378"
-    },
-    {
-      "id": "ad891298-871d-4696-82b1-4fc30decaa59",
-      "title": "Day 3: July 9th, 2026**",
-      "date": "2026-07-09",
-      "time": "",
-      "description": "Trip to Goa",
-      "type": "travel",
-      "source": "ai_travel",
-      "color": "#22c55e",
-      "created_at": "2026-07-07T07:11:30.527975"
-    },
-    {
-      "id": "6138bdad-8f2c-4d87-a0c8-98af1764987c",
-      "title": "Day 3: Travel Tips:**",
-      "date": "2026-07-09",
-      "time": "",
-      "description": "Trip to Goa",
-      "type": "travel",
-      "source": "ai_travel",
-      "color": "#22c55e",
-      "created_at": "2026-07-07T07:11:30.538978"
-    },
-    {
       "id": "28d09b16-fa18-4fea-8511-64551c4ab8fd",
       "title": "Dentist Appointment",
       "date": "2026-07-20",
@@ -208,6 +76,204 @@
       "source": "ai_agent",
       "color": "#8b5cf6",
       "created_at": "2026-07-08T02:52:17.297437"
+    },
+    {
+      "id": "dbe3d841-670d-4337-8f1d-9a79b38d20d8",
+      "title": "Day 1: Arrival in Kathmandu",
+      "date": "2026-08-01",
+      "time": "",
+      "description": "Trip to Kathmandu",
+      "type": "travel",
+      "source": "ai_travel",
+      "color": "#22c55e",
+      "created_at": "2026-07-24T10:05:53.440930"
+    },
+    {
+      "id": "259806f8-ddd2-4b7c-9759-980f107f8082",
+      "title": "Day 2: Historical Sites",
+      "date": "2026-08-02",
+      "time": "",
+      "description": "Trip to Kathmandu",
+      "type": "travel",
+      "source": "ai_travel",
+      "color": "#22c55e",
+      "created_at": "2026-07-24T10:05:53.456933"
+    },
+    {
+      "id": "676ba35c-72fc-4c16-a1d9-c5cb7e59a2ea",
+      "title": "Day 3: Museums",
+      "date": "2026-08-03",
+      "time": "",
+      "description": "Trip to Kathmandu",
+      "type": "travel",
+      "source": "ai_travel",
+      "color": "#22c55e",
+      "created_at": "2026-07-24T10:05:53.467928"
+    },
+    {
+      "id": "24badd4e-d066-4577-9e99-54ad45119467",
+      "title": "Day 4: Parks and Gardens",
+      "date": "2026-08-04",
+      "time": "",
+      "description": "Trip to Kathmandu",
+      "type": "travel",
+      "source": "ai_travel",
+      "color": "#22c55e",
+      "created_at": "2026-07-24T10:05:53.479132"
+    },
+    {
+      "id": "3fc58881-7b1c-4412-b02f-65418f7d8edd",
+      "title": "Day 5: Historical Sites",
+      "date": "2026-08-05",
+      "time": "",
+      "description": "Trip to Kathmandu",
+      "type": "travel",
+      "source": "ai_travel",
+      "color": "#22c55e",
+      "created_at": "2026-07-24T10:05:53.490270"
+    },
+    {
+      "id": "0cafb271-bb8f-4c4f-9b10-8bc2e05739b2",
+      "title": "Day 6: Museums",
+      "date": "2026-08-06",
+      "time": "",
+      "description": "Trip to Kathmandu",
+      "type": "travel",
+      "source": "ai_travel",
+      "color": "#22c55e",
+      "created_at": "2026-07-24T10:05:53.501270"
+    },
+    {
+      "id": "d4ee6e15-59d6-4ff0-843d-1cc5b6fff872",
+      "title": "Day 7: Rest day",
+      "date": "2026-08-07",
+      "time": "",
+      "description": "Trip to Kathmandu",
+      "type": "travel",
+      "source": "ai_travel",
+      "color": "#22c55e",
+      "created_at": "2026-07-24T10:05:53.512589"
+    },
+    {
+      "id": "77150d34-252c-4b24-bd14-5721414253f3",
+      "title": "Day 8: Historical Sites",
+      "date": "2026-08-08",
+      "time": "",
+      "description": "Trip to Kathmandu",
+      "type": "travel",
+      "source": "ai_travel",
+      "color": "#22c55e",
+      "created_at": "2026-07-24T10:05:53.522237"
+    },
+    {
+      "id": "cf533819-2efe-4b61-87a5-794f112dafd2",
+      "title": "Day 9: Museums",
+      "date": "2026-08-09",
+      "time": "",
+      "description": "Trip to Kathmandu",
+      "type": "travel",
+      "source": "ai_travel",
+      "color": "#22c55e",
+      "created_at": "2026-07-24T10:05:53.534237"
+    },
+    {
+      "id": "2682e86e-6929-485d-9189-754356600004",
+      "title": "Day 10: Parks and Gardens",
+      "date": "2026-08-10",
+      "time": "",
+      "description": "Trip to Kathmandu",
+      "type": "travel",
+      "source": "ai_travel",
+      "color": "#22c55e",
+      "created_at": "2026-07-24T10:05:53.545022"
+    },
+    {
+      "id": "d0b4a988-7390-4c81-b21a-42cb2dc08999",
+      "title": "Day 1: Arrival in Kathmandu (July 31, 2026)",
+      "date": "2026-07-31",
+      "time": "",
+      "description": "Trip to Kathmandu",
+      "type": "travel",
+      "source": "ai_travel",
+      "color": "#22c55e",
+      "created_at": "2026-07-24T10:38:01.570427"
+    },
+    {
+      "id": "5d1d51d6-4553-4aef-98a5-4d5c32563fc1",
+      "title": "Day 3: Patan and Bhaktapur",
+      "date": "2026-08-02",
+      "time": "",
+      "description": "Trip to Kathmandu",
+      "type": "travel",
+      "source": "ai_travel",
+      "color": "#22c55e",
+      "created_at": "2026-07-24T10:38:01.602425"
+    },
+    {
+      "id": "305707b1-d090-4bf7-8337-9c897b4164c0",
+      "title": "Day 4: Hiking and Nature",
+      "date": "2026-08-03",
+      "time": "",
+      "description": "Trip to Kathmandu",
+      "type": "travel",
+      "source": "ai_travel",
+      "color": "#22c55e",
+      "created_at": "2026-07-24T10:38:01.616425"
+    },
+    {
+      "id": "131a07c8-29d3-454e-8a77-6e3ab82bbd2d",
+      "title": "Day 5: Swayambhunath and Thamel",
+      "date": "2026-08-04",
+      "time": "",
+      "description": "Trip to Kathmandu",
+      "type": "travel",
+      "source": "ai_travel",
+      "color": "#22c55e",
+      "created_at": "2026-07-24T10:38:01.629424"
+    },
+    {
+      "id": "f8e0cb0d-501e-4f87-82fa-3b9b55765952",
+      "title": "Day 1: Montmartre, Sacré-Cœur, and the Latin Quarter",
+      "date": "2026-07-24",
+      "time": "",
+      "description": "Trip to Paris",
+      "type": "travel",
+      "source": "ai_travel",
+      "color": "#22c55e",
+      "created_at": "2026-07-24T12:43:11.485505"
+    },
+    {
+      "id": "d8aca6b6-c332-4ccb-8463-04116fa893b8",
+      "title": "Day 2: Iconic Paris",
+      "date": "2026-07-25",
+      "time": "",
+      "description": "Trip to Paris",
+      "type": "travel",
+      "source": "ai_travel",
+      "color": "#22c55e",
+      "created_at": "2026-07-24T12:43:11.501506"
+    },
+    {
+      "id": "2431392b-af6b-4eaa-a573-a376e8031b4f",
+      "title": "Day 3: Royal Palace and Gardens",
+      "date": "2026-07-26",
+      "time": "",
+      "description": "Trip to Paris",
+      "type": "travel",
+      "source": "ai_travel",
+      "color": "#22c55e",
+      "created_at": "2026-07-24T12:43:11.513505"
+    },
+    {
+      "id": "a4c1cf2c-5333-436a-870e-fae037c5898f",
+      "title": "Dentist Appointment",
+      "date": "next month's 3rd",
+      "time": "",
+      "description": "",
+      "type": "event",
+      "source": "ai_agent",
+      "color": "#8b5cf6",
+      "created_at": "2026-08-14T11:43:46.003113"
     }
   ]
 }

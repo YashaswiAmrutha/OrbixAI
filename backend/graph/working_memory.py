@@ -22,6 +22,7 @@ Schema (architecture §5.2 / §9.1):
     extract_queue (msg_id, session_id, status, tries)   status: pending|done|failed
 """
 
+import os
 import time
 import uuid
 import sqlite3
@@ -192,13 +193,92 @@ def add_message(session_id: str, role: str, text: str,
     return msg_id
 
 
-def get_messages(session_id: str, limit: int = 50) -> list[dict]:
-    """Return the most recent turns for a session, oldest-first (for LLM context)."""
+# Bound what counts as "the current conversation" even under a session_id that's
+# reused indefinitely (the frontend persists it in localStorage until "New Chat" is
+# clicked). Without this, a stale session_id can feed a week-old, unrelated exchange
+# into a brand-new question as if it were live context — confirmed live: "who am i?"
+# got answered as a buried request from a week earlier, which then re-executed a real
+# send_email call. Both cutoffs are env-configurable so they can be tuned without a
+# redeploy.
+_DEFAULT_MAX_AGE_S = int(os.environ.get("ORBIX_CONTEXT_MAX_AGE_S", str(24 * 3600)))
+_DEFAULT_IDLE_GAP_S = int(os.environ.get("ORBIX_CONTEXT_IDLE_GAP_S", str(40 * 60)))
+
+
+def get_messages(session_id: str, limit: int = 50, *,
+                 max_age_seconds: int | None = None,
+                 idle_gap_seconds: int | None = None) -> list[dict]:
+    """
+    Return the most recent turns for a session, oldest-first (for LLM context).
+
+    Two independent cutoffs, applied on top of the row-count limit:
+      - idle_gap_seconds: stop at the first gap between consecutive messages larger
+        than this — everything on the far side is a closed topic even under the same
+        session_id (this is what actually stops old buried requests from bleeding
+        into a new one).
+      - max_age_seconds: hard backstop — never return anything older than this,
+        regardless of gap pattern.
+    """
+    if max_age_seconds is None:
+        max_age_seconds = _DEFAULT_MAX_AGE_S
+    if idle_gap_seconds is None:
+        idle_gap_seconds = _DEFAULT_IDLE_GAP_S
+
     with _conn() as con:
         rows = con.execute(
             "SELECT id, role, text, ts FROM messages "
             "WHERE session_id = ? ORDER BY id DESC LIMIT ?",
             (session_id, limit),
+        ).fetchall()
+    rows = [dict(r) for r in rows]  # newest-first
+    if not rows:
+        return []
+
+    now_ms = _now_ms()
+    max_age_ms = max_age_seconds * 1000
+    idle_gap_ms = idle_gap_seconds * 1000
+
+    kept: list[dict] = []
+    prev_ts = None
+    cutoff_reason = None
+    for r in rows:
+        if now_ms - r["ts"] > max_age_ms:
+            cutoff_reason = "max_age"
+            break
+        if prev_ts is not None and (prev_ts - r["ts"]) > idle_gap_ms:
+            cutoff_reason = "idle_gap"
+            break
+        kept.append(r)
+        prev_ts = r["ts"]
+
+    if cutoff_reason:
+        logger.info(
+            "get_messages(session=%s): trimmed %d/%d row(s) via %s cutoff",
+            session_id, len(rows) - len(kept), len(rows), cutoff_reason,
+        )
+
+    return list(reversed(kept))
+
+
+def search_messages(session_id: str, query: str, limit: int = 5) -> list[dict]:
+    """
+    Keyword search over ALL of this session's messages, not just the recent window
+    get_messages() returns for live prompt context — recovers turns that scrolled
+    out of that window (or a "chit-chat" turn extraction never promoted to Neo4j,
+    since extraction only mines user turns judged fact-worthy). Simple per-term
+    case-insensitive substring match (LIKE); a session's row count is realistically
+    in the hundreds, so this doesn't need a real full-text index.
+    """
+    terms = [t.strip() for t in query.split() if t.strip()]
+    if not terms:
+        return []
+    clauses = " AND ".join(["text LIKE ?"] * len(terms))
+    params: list = [session_id, *[f"%{t}%" for t in terms], limit]
+    with _conn() as con:
+        rows = con.execute(
+            f"SELECT role, text, ts FROM messages "
+            f"WHERE session_id = ? AND ({clauses}) "
+            f"ORDER BY id DESC LIMIT ?",
+            params,
         ).fetchall()
     return [dict(r) for r in reversed(rows)]
 

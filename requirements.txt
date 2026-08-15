@@ -1,3 +1,8 @@
+# Host development dependencies.
+#
+# For the reproducible container build see requirements.docker.txt, which pins exact
+# versions and omits the three audio packages below (they need real audio hardware).
+
 fastapi
 uvicorn
 faster-whisper
@@ -5,18 +10,31 @@ requests
 ollama
 numpy>=2.0.0
 python-multipart
+
+# Audio helpers — used ONLY by the standalone voice/stt.py and voice/tts.py scripts,
+# not by the served app (which uses faster-whisper in-process and browser TTS).
 sounddevice
 pyttsx3
 scipy
+
 google-auth-oauthlib
 google-auth-httplib2
 google-api-python-client
+
 python-dotenv
-neo4j
 PyYAML
-mcp
 beautifulsoup4
+neo4j
+
+mcp
 langgraph
-langchain
+# NOTE: `langchain` was listed here but nothing in the codebase imports it — only
+# langgraph is used. It also actively broke the container build: langchain pins
+# numpy<2 on Python 3.11, which conflicts with the numpy>=2 the rest of the stack
+# needs. Removed rather than pinned around.
+
+# Travel integrations. These were listed but NOT actually installed on the host, so
+# `import serpapi` failed and took google_service/travel_services.py — and with it the
+# entire travel-planning branch — down at import time.
 amadeus
 google-search-results

@@ -20,7 +20,11 @@ import logging
 logger = logging.getLogger(__name__)
 
 ORCHESTRATOR_MODEL = "gpraneeth555/Llama-3-13k:latest"
-FALLBACK_MODEL     = "llama3.2:3b"
+# Must be a locally-pulled tag — `ollama list` on this machine only has
+# llama3.2:latest (no "3b" tag), so the old "llama3.2:3b" here silently broke
+# this fallback (model-not-found) any time the fine-tuned model errored,
+# contradicting this function's own docstring ("falls back to llama3.1:8b").
+FALLBACK_MODEL     = "llama3.1:8b"
 
 # ── GPU workaround: model must run on CPU (CUDA runtime issue on this machine) ─
 _OLLAMA_OPTIONS = {"temperature": 0.1, "num_predict": 1024, "num_gpu": 0}

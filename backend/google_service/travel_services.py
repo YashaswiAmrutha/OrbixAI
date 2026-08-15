@@ -371,7 +371,7 @@ def generate_itinerary(city: str, attractions: List[Dict], num_days: int,
     # would break the MCP itinerary round-trip.
     try:
         import ollama
-        model = os.environ.get("ORBIX_TRAVEL_MODEL", "llama3.2:3b")
+        model = os.environ.get("ORBIX_TRAVEL_MODEL", "llama3.1:8b")  # see travel_planner.py note
         resp = ollama.chat(
             model=model,
             messages=[{"role": "user", "content": prompt}],

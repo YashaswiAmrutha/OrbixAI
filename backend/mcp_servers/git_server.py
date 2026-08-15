@@ -56,17 +56,49 @@ def _repo(path: str) -> tuple[Path | None, str | None]:
     if not p:
         # default to the first root if the model didn't specify a repo
         p = str(roots[0])
+
+    candidate = Path(p).expanduser()
+    if not candidate.is_absolute():
+        # A bare name ("current_repo", "OrbixAI") must be interpreted against the
+        # CONFIGURED ROOTS, never against the process working directory. Resolving
+        # relative to cwd produced <root>/backend/current_repo, which then PASSED the
+        # containment check below purely by accident and handed git a path that does
+        # not exist — surfacing as "fatal: cannot change to ..." that the model then
+        # apologised for, instead of a usable error.
+        match = None
+        for root in roots:
+            if root.name.lower() == p.lower() or (root / p).exists():
+                match = (root / p) if (root / p).exists() else root
+                break
+        candidate = match if match is not None else roots[0] / p
+
     try:
-        rp = Path(p).expanduser().resolve()
+        rp = candidate.resolve()
     except Exception as e:  # noqa: BLE001
         return None, f"invalid path: {e}"
-    for root in roots:
-        try:
-            rp.relative_to(root)
-            return rp, None
-        except ValueError:
-            continue
-    return None, f"'{rp}' is outside your allowed git folders"
+
+    inside = any(_is_within(rp, root) for root in roots)
+    if not inside:
+        return None, f"'{rp}' is outside your allowed git folders"
+
+    # Confirm it actually is a repository before shelling out, so a wrong guess gets
+    # an actionable message naming the real options rather than a raw git fatal.
+    if not rp.exists():
+        opts = ", ".join(str(r) for r in roots)
+        return None, f"no such folder '{rp}'. Configured git folders: {opts}"
+    if not (rp / ".git").exists():
+        opts = ", ".join(str(r) for r in roots)
+        return None, (f"'{rp}' is not a git repository (no .git). "
+                      f"Configured git folders: {opts}")
+    return rp, None
+
+
+def _is_within(child: Path, parent: Path) -> bool:
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
 
 
 def _git(repo: Path, *args: str) -> dict:
@@ -74,6 +106,13 @@ def _git(repo: Path, *args: str) -> dict:
         proc = subprocess.run(
             ["git", "-C", str(repo), *args],
             capture_output=True, text=True, timeout=_TIMEOUT,
+            # This server itself runs as an MCP stdio subprocess — its own stdin
+            # is the JSON-RPC pipe, not a real terminal. Without explicitly
+            # closing it here, the nested `git` process inherits that pipe on
+            # Windows and can block waiting on it. Confirmed live: this exact
+            # command ran in 0.05s standalone but hung to the 20s timeout when
+            # spawned from inside this server.
+            stdin=subprocess.DEVNULL,
         )
     except FileNotFoundError:
         return {"error": "git is not installed or not on PATH"}

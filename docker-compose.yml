@@ -1,0 +1,133 @@
+# OrbixAI full local stack: backend + Neo4j + Ollama.
+#
+#   docker compose up -d        then open http://localhost:8001
+#
+# Everything runs on your own machine. No component calls a hosted LLM, so the
+# "fully local" property is preserved — containers are process isolation on this
+# host, not remote compute. See the `orbix-internal` network note below for how
+# this setup also makes that property auditable rather than merely asserted.
+
+services:
+  # ── Long-term memory: the knowledge graph ──────────────────────────────────
+  # Community Edition is free and open-source; only Enterprise (clustering, RBAC,
+  # hot backups, multi-database) is paid. Single-user memory needs none of that.
+  neo4j:
+    # Version-matched to the development instance (Neo4j Desktop ships 2026.03.x).
+    # A 5.26 server rejected the 6.1.0 Python driver's auth token outright
+    # ("scheme 'basic' is not supported"), so the tag must track the driver.
+    # Edition note: Desktop bundles ENTERPRISE for local development; this artifact
+    # runs COMMUNITY. Nothing in the schema needs Enterprise — no clustering, RBAC,
+    # multi-database or hot backups — only constraints and fulltext indexes, which
+    # Community supports.
+    image: neo4j:2026.03-community
+    container_name: orbix-neo4j
+    environment:
+      # NEO4J_AUTH is read only on FIRST start, when the store is initialized.
+      # Changing it later has no effect unless the data volume is removed.
+      NEO4J_AUTH: "${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}"
+      # Credentials for the healthcheck, deliberately NOT prefixed "NEO4J_":
+      # this image turns every NEO4J_* variable into a server config setting, so
+      # NEO4J_PASSWORD became an unrecognized setting named PASSWORD and the server
+      # refused to boot at all ("Failed to read config: Unrecognized setting").
+      ORBIX_DB_USER: "${NEO4J_USER:-neo4j}"
+      ORBIX_DB_PASSWORD: "${NEO4J_PASSWORD}"
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 1G
+      NEO4J_server_memory_pagecache_size: 512m
+    ports:
+      # Host ports are overridable so this stack can run alongside an existing
+      # local Neo4j (e.g. Neo4j Desktop already holding 7687) — needed to copy
+      # data between the two. Container-side ports never change.
+      - "${NEO4J_HTTP_PORT:-7474}:7474"   # Neo4j Browser
+      - "${NEO4J_BOLT_PORT:-7687}:7687"   # Bolt
+    volumes:
+      - neo4j-data:/data
+      - neo4j-logs:/logs
+    healthcheck:
+      # Proves Bolt actually answers a query, not just that the port is open.
+      test: ["CMD-SHELL", "cypher-shell -u \"$${ORBIX_DB_USER}\" -p \"$${ORBIX_DB_PASSWORD}\" 'RETURN 1' >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 45s
+    restart: unless-stopped
+    networks: [orbix-internal]
+
+  # ── Local LLM runtime ──────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: orbix-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      # Named volume, never an image layer: model weights are multi-GB and must
+      # not be baked in or pushed to a registry.
+      - ollama-models:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    networks: [orbix-internal]
+    # GPU: uncomment if you have working NVIDIA container support. CPU-only
+    # otherwise, which matches the current host configuration.
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices: [{driver: nvidia, count: all, capabilities: [gpu]}]
+
+  # ── The app ────────────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${ORBIX_IMAGE:-orbixai-backend}:${ORBIX_TAG:-latest}
+    container_name: orbix-backend
+    depends_on:
+      neo4j: {condition: service_healthy}
+      ollama: {condition: service_started}
+    environment:
+      NEO4J_URI: neo4j://neo4j:7687
+      NEO4J_USERNAME: ${NEO4J_USER:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}
+      OLLAMA_HOST: http://ollama:11434
+      ORBIX_FILES_ROOTS: /workspace
+      ORBIX_GIT_ROOTS: /workspace
+    ports:
+      - "8001:8001"
+    volumes:
+      # Secrets and mutable state are MOUNTED, never baked in (see .dockerignore).
+      - ./backend/credentials.json:/app/backend/credentials.json:ro
+      - ./backend/mcp_state.json:/app/backend/mcp_state.json
+      # OAuth token: a named volume, NOT a bind mount. Docker silently creates a
+      # DIRECTORY when a bind-mounted file is missing on the host, which would then
+      # make token.json unreadable-as-a-file and break Gmail in a confusing way.
+      # A volume also survives rebuilds and keeps the refreshed token off the host.
+      # Sign in once at http://localhost:8001/auth/login after the stack is up.
+      - orbix-oauth:/app/backend/oauth
+      # Durable local state that should survive a container rebuild.
+      - orbix-state:/app/backend/state
+      - ./backend/metrics:/app/backend/metrics
+      # What the file/git tools are allowed to see. Scope this deliberately —
+      # it is the container's entire view of your disk.
+      - ./:/workspace
+    restart: unless-stopped
+    networks: [orbix-internal]
+
+networks:
+  orbix-internal:
+    driver: bridge
+    # For the privacy audit described in the evaluation docs, set:
+    #   internal: true
+    # That removes external routing entirely, so the stack demonstrably cannot
+    # reach the internet. Note this also disables the outward integrations
+    # (Gmail, GitHub, web search), so use it for the egress experiment only.
+
+volumes:
+  neo4j-data:
+  neo4j-logs:
+  ollama-models:
+  orbix-state:
+  orbix-oauth:

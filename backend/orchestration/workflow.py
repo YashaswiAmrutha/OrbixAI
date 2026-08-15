@@ -11,8 +11,10 @@ Implements the core workflow graph:
 Phase 2: Real module integration with agent, travel planner, and action executor.
 """
 
+import asyncio
 import logging
 import re
+import threading
 import time
 
 from langgraph.graph import StateGraph, START, END
@@ -22,6 +24,13 @@ from .routing import route_query, determine_module
 from graph.working_memory import add_message, get_messages, start_session
 
 logger = logging.getLogger(__name__)
+
+# asyncio.create_task() only holds a WEAK reference to the task it returns — if
+# nothing else keeps it alive, the event loop can garbage-collect a fire-and-forget
+# task mid-execution ("Task was destroyed but it is pending"). This module-level
+# set is the standard workaround: hold a strong reference until the task's own
+# done-callback removes it.
+_BACKGROUND_TASKS: set = set()
 
 
 # ============================================================================ #
@@ -74,8 +83,12 @@ def _travel_calendar_events(itinerary: str, destination: str, departure_date: st
         for day_str, title in matches:
             day_num = int(day_str)
             event_date = base_date + timedelta(days=day_num - 1)
+            # Strip trailing markdown emphasis markers (e.g. "...Landmarks**" from
+            # a "**Day 1: ...Landmarks**" bold heading line) so they don't leak
+            # into the calendar event title.
+            clean_title = re.sub(r'[\*_#]+$', '', title.strip()).strip()
             events.append({
-                "title": f"Day {day_num}: {title.strip()[:70]}",
+                "title": f"Day {day_num}: {clean_title[:70]}",
                 "date": event_date.strftime("%Y-%m-%d"),
                 "time": "",
                 "description": f"Trip to {destination}",
@@ -170,25 +183,14 @@ def prepare_context(state: OrbixState) -> OrbixState:
         logger.error(f"Failed to retrieve transcript: {e}")
         state["transcript"] = []
     
-    # Tier 2: Fetch Neo4j facts (Phase 5 - Real Data)
-    try:
-        from orchestration.memory_integration import get_memory_integration
-        memory = get_memory_integration()
-        
-        # Fetch user profile, recent trips, contacts, preferences
-        recent_trips = memory.get_recent_trips(limit=3)
-        contacts = memory.get_contacts(limit=10)
-        preferences = memory.get_preferences()
-        
-        state["retrieved_facts"] = {
-            "recent_trips": recent_trips,
-            "contacts": contacts,
-            "preferences": preferences,
-        }
-        logger.info(f"Retrieved Neo4j context: {len(recent_trips)} trips, {len(contacts)} contacts")
-    except Exception as e:
-        logger.error(f"Failed to fetch Neo4j context: {e}")
-        state["retrieved_facts"] = {"recent_trips": [], "contacts": [], "preferences": {}}
+    # Tier 2: Neo4j facts (recent trips/contacts/preferences) — NOT fetched here.
+    # Neither chat_node (uses agent.run_turn()'s own MCP `recall` call) nor
+    # travel_node (uses plan_trip()'s own pipeline) reads state["retrieved_facts"],
+    # so eagerly running 3 Neo4j queries here was pure latency on every single
+    # turn regardless of intent. Left as the documented default shape (see
+    # graph_state.py) for whichever node ends up wanting it; call
+    # memory_integration.get_memory_integration() there instead of here.
+    state["retrieved_facts"] = {"recent_trips": [], "contacts": [], "preferences": {}}
     
     # Tier 3: Detect multi-intent queries (Phase 4 - Action Chaining)
     try:
@@ -254,15 +256,26 @@ async def chat_node(state: OrbixState) -> OrbixState:
         state["module_output"] = {
             "response": response,
             "module": "chat",
-            "data": {"agent_response": response, "trace_steps": len(trace)}
+            "data": {
+                "agent_response": response,
+                "trace_steps": len(trace),
+                # Wall-clock time run_turn actually took (recall + every LLM/tool
+                # call, summed) — surfaced through to the API response so turn
+                # latency can be read directly without parsing backend logs.
+                "elapsed_seconds": result.get("elapsed_seconds"),
+            }
         }
 
-        # Enqueue extraction from the response (agent already persists the turn)
+        # Enqueue extraction from the response (agent already persists the turn).
+        # user_msg_id lets the extraction task mark its own extract_queue row done on
+        # success, so the durable retry safety net (drained later if this fast path
+        # fails) never double-processes a turn that already succeeded here.
         state["extraction_tasks"].append({
             "type": "extract_from_turn",
             "user_text": user_query,
             "assistant_text": response,
             "session_id": state["session_id"],
+            "user_msg_id": result.get("user_msg_id"),
         })
 
         logger.info(f"Chat node completed successfully with {len(trace)} tool steps")
@@ -350,6 +363,66 @@ async def travel_node(state: OrbixState) -> OrbixState:
             state["calendar_events"] = []
         state["todo_items"] = [{"text": f"Plan trip to {to_city}", "source": "ai_travel"}]
 
+        # Phase 4 (action chaining): travel_node has no tool-calling ability of its
+        # own, so a compound request like "plan a trip... then email me the plan"
+        # previously planned the trip and silently dropped everything else —
+        # prepare_context() already detects the extra intents via action_chaining.py
+        # (state["follow_up_actions"]) but nothing executed them. Only send_email is
+        # actually a gap: calendar is already covered by the per-day events created
+        # above, and create_meeting is excluded here — confirmed live that leaving it
+        # in makes the model create an unrequested real Google Meet (action_chaining.py
+        # was also over-triggering "create_meeting" on the word "calendar"; fixed
+        # there too). Hand ONLY the email step to the general MCP agent (same one
+        # chat_node uses) with an explicit list of what's already done, in THIS turn,
+        # capped at a few steps since there's exactly one thing left to do. Uses a
+        # side session id so this internal exchange doesn't pollute the visible
+        # session transcript.
+        follow_up_intents = set(state.get("follow_up_actions") or [])
+        if "send_email" in follow_up_intents:
+            try:
+                _emit(state, "Finishing the rest of your request…")
+                from mcp_host.agent import run_turn as _agent_run_turn
+
+                async def _followup_event(ev):
+                    step = ev.get("step") if isinstance(ev, dict) else None
+                    if step:
+                        _emit(state, step)
+
+                followup_instruction = (
+                    f'The user\'s original request was: "{user_query}"\n'
+                    "You already planned this trip and their calendar has ALREADY "
+                    "been updated with the day-by-day itinerary. Do NOT create a "
+                    "calendar event. Do NOT create a Google Meet or any meeting — "
+                    "nothing about this request needs one. Do NOT re-plan the trip or "
+                    "repeat the itinerary back to them.\n\n"
+                    "Complete EVERY remaining part of their request that is NOT about "
+                    "planning this trip — read it carefully, it may ask for MORE THAN "
+                    "ONE email (each with its own distinct content), or an email plus a "
+                    "to-do. Do each one as its own separate tool call; don't stop after "
+                    "the first if more were asked for.\n\n"
+                    "Figure out who each email actually goes to from the request itself "
+                    "— do NOT default to the user's own address unless they clearly meant "
+                    "themselves ('email me', 'mail it to myself'). If they named someone "
+                    "else (e.g. 'my assistant') and no email for that person is in what "
+                    "you already know, ASK the user for that address in your final reply "
+                    "instead of guessing or sending it to yourself.\n\n"
+                    "TRIP PLAN (use this content for any email ABOUT the trip itself):\n"
+                    + response
+                )
+                agent_out = await _agent_run_turn(followup_instruction,
+                                                  session_id=f"{session_id}:followup",
+                                                  max_steps=6, on_event=_followup_event)
+                followup_reply = (agent_out.get("reply") or "").strip()
+                if followup_reply:
+                    response = response + "\n\n" + followup_reply
+                f_cal, f_todos = _calendar_events_from_trace(agent_out.get("trace", []))
+                if f_cal:
+                    state["calendar_events"] = (state.get("calendar_events") or []) + f_cal
+                if f_todos:
+                    state["todo_items"] = (state.get("todo_items") or []) + f_todos
+            except Exception as e:
+                logger.error(f"Travel follow-up actions failed: {e}")
+
         state["module_output"] = {
             "response": response,
             "module": "travel",
@@ -408,12 +481,12 @@ def format_response(state: OrbixState) -> OrbixState:
     return state
 
 
-def background_tasks(state: OrbixState) -> OrbixState:
+async def background_tasks(state: OrbixState) -> OrbixState:
     """
     Phase 3: Execute extraction tasks in parallel (async).
     Phase 4: Handle follow-up actions if multi-intent was detected.
     Phase 5: Store extracted data to Neo4j.
-    
+
     This node returns immediately after queueing async tasks.
     Actual execution happens in background job queue.
     """
@@ -434,34 +507,30 @@ def background_tasks(state: OrbixState) -> OrbixState:
         try:
             from orchestration.extraction_executor import get_executor
             executor = get_executor()
-            
-            # Queue extraction tasks to run asynchronously
-            # In a real implementation, these would be queued to a Celery/RQ job queue
-            # For now, we'll spawn them as async tasks
-            import threading
-            
-            def run_extractions():
+
+            # Fire-and-forget on the SAME running event loop (this node is async,
+            # invoked via workflow.ainvoke) instead of a thread spinning its own
+            # second event loop per turn. A done-callback logs the outcome in one
+            # place so a failure is never silently swallowed inside the thread —
+            # the extract_queue row itself still stays 'pending' on failure (set
+            # inside execute_tasks), so the maintenance loop's drain still retries
+            # it regardless of whether this callback runs.
+            def _log_extraction_result(t: asyncio.Task) -> None:
                 try:
-                    import asyncio
-                    # Create new event loop in thread
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    
-                    # Execute all extraction tasks in parallel
-                    result = loop.run_until_complete(
-                        executor.execute_tasks(state["extraction_tasks"], session_id)
-                    )
-                    
-                    logger.info(f"Extraction completed: {result['success']} success, {result['failed']} failed")
-                    loop.close()
+                    result = t.result()
+                    logger.info(f"Extraction completed: {result['success']} success, "
+                               f"{result['failed']} failed"
+                               + (f" — errors: {result['errors']}" if result.get("errors") else ""))
                 except Exception as e:
-                    logger.error(f"Background extraction error: {e}", exc_info=True)
-            
-            # Start extraction in background thread (non-blocking)
-            extraction_thread = threading.Thread(target=run_extractions, daemon=True)
-            extraction_thread.start()
+                    logger.error(f"Background extraction task crashed: {e}", exc_info=True)
+
+            extraction_task = asyncio.create_task(
+                executor.execute_tasks(state["extraction_tasks"], session_id))
+            _BACKGROUND_TASKS.add(extraction_task)
+            extraction_task.add_done_callback(_log_extraction_result)
+            extraction_task.add_done_callback(_BACKGROUND_TASKS.discard)
             logger.info("Extraction tasks queued for background execution")
-            
+
         except Exception as e:
             logger.error(f"Error queueing extraction tasks: {e}")
 

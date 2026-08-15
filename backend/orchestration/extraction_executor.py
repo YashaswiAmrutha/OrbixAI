@@ -75,10 +75,16 @@ class ExtractionExecutor:
         """
         Extract durable facts from the user's turn and persist them to Neo4j.
 
-        This is now the single write path for chat memory (the old flush-barrier /
-        SQLite-queue drain has been removed). It reuses the proven extraction engine
-        (heuristic gate -> structured-output LLM -> resolve/reconcile/upsert) so writes
-        land in the same :Entity/:Fact/:Memory graph the agent reads via recall().
+        This is the fast path for chat memory. `agent.py` also enqueues the same
+        message into SQLite's `extract_queue` (durable, survives a crash/restart) as a
+        retry safety net — on success here we mark_done() that row immediately so the
+        scheduled maintenance loop's drain pass never reprocesses it; on failure we
+        leave it 'pending' so that drain pass retries it later instead of the fact
+        being lost outright.
+
+        Reuses the proven extraction engine (heuristic gate -> structured-output LLM ->
+        resolve/reconcile/upsert) so writes land in the same :Entity/:Fact/:Memory graph
+        the agent reads via recall().
 
         Only the user's turn is mined (matching the original design — the assistant's
         text is not treated as a source of durable facts).
@@ -86,8 +92,10 @@ class ExtractionExecutor:
         try:
             user_text = task.get("user_text", "")
             session_id = task.get("session_id")
+            user_msg_id = task.get("user_msg_id")
 
             from mcp_host import extractor
+            from graph import working_memory as wm
 
             def _run() -> int:
                 # Cheap gate first; skip questions/greetings/chit-chat without an LLM call.
@@ -97,12 +105,15 @@ class ExtractionExecutor:
                 return extractor._persist(result, source="langgraph")  # -> Neo4j (idempotent MERGE)
 
             writes = await asyncio.to_thread(_run)
+            if user_msg_id is not None:
+                await asyncio.to_thread(wm.mark_done, user_msg_id)
             logger.info(f"extract_from_turn: {writes} write(s) to Neo4j (session {session_id})")
             return {"success": True, "writes": writes}
 
         except Exception as e:
-            # Fire-and-forget: on failure (e.g. Neo4j down) the fact is lost — there is no
-            # durable retry queue anymore. Logged so it's visible.
+            # On failure (e.g. Neo4j down), leave the extract_queue row 'pending' —
+            # the scheduled maintenance loop's drain pass is the retry path now, so
+            # the fact isn't lost outright. Logged so it's visible either way.
             logger.error(f"Error in _extract_from_turn: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
@@ -129,13 +140,22 @@ class ExtractionExecutor:
             driver = get_driver()
 
             # Create :Trip node in Neo4j
-            trip_id = str(uuid4())[:8]
+            # Deterministic id, derived from what actually identifies a trip.
+            # This was str(uuid4())[:8] — a fresh random id every call — so the MERGE
+            # below could never match an existing node and the "idempotent" comment
+            # was untrue: re-planning the same trip produced a brand-new :Trip node
+            # each time, duplicating it and its whole subtree of flights/stays.
+            # Same recipe memory_integration.store_trip() uses, so both write paths
+            # now converge on one node instead of racing to create two.
+            trip_id = f"trip:{(to_city or 'unknown').strip().lower()}:{check_in or ''}"
             with driver.session() as session:
-                # Merge trip node (idempotent)
+                # Merge trip node (now genuinely idempotent)
                 session.run(
                     """
-                    MERGE (t:Trip {id: $trip_id})
-                    ON CREATE SET 
+                    MERGE (t:Trip:Entity {id: $trip_id})
+                    ON CREATE SET
+                        t.key = $trip_id,
+                        t.name = $to_city,
                         t.from_city = $from_city,
                         t.to_city = $to_city,
                         t.check_in = $check_in,
@@ -159,8 +179,9 @@ class ExtractionExecutor:
                 # Create :Location node for destination
                 session.run(
                     """
-                    MERGE (l:Location {name: $city, type: 'city'})
-                    ON CREATE SET l.created_at = datetime()
+                    MERGE (l:Location:Entity {name: $city, type: 'city'})
+                    ON CREATE SET l.key = 'location:' + toLower($city),
+                                  l.created_at = datetime()
                     WITH l
                     MATCH (t:Trip {id: $trip_id})
                     MERGE (t)-[:DESTINATION]->(l)

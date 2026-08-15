@@ -1,0 +1,42 @@
+# ── Secrets: these are MOUNTED at runtime, never baked into an image ──────────
+# An image layer is permanent and pushable to a registry; anything copied in here
+# would be extractable by anyone who pulls it. Keep every credential out.
+.env
+*.env
+!.env.docker.example
+backend/token.json
+backend/credentials.json
+backend/mcp_state.json
+backend/model_state.json
+**/token.json
+**/credentials.json
+
+# ── Local state / data that must not travel with the image ───────────────────
+backend/session.db
+backend/session.db-wal
+backend/session.db-shm
+backend/metrics/
+backend/tasks_store.json
+Docs/profile.md
+
+# ── Bulk / regenerable ───────────────────────────────────────────────────────
+.git
+.gitignore
+.venv
+venv/
+env/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+node_modules/
+
+# ── Host-only tooling & docs ─────────────────────────────────────────────────
+.claude/
+voice/
+*.md
+!README.md

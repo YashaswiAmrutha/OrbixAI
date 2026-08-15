@@ -11,7 +11,12 @@ from google_service.travel_planner import plan_trip
 from intent_workflow import IntentClassifier
 from calendar_store import get_events, create_event, bulk_create_events, update_event, delete_event
 from faster_whisper import WhisperModel
-from graph.working_memory import init_db as init_working_memory, cleanup_expired_messages
+from graph.working_memory import (
+    init_db as init_working_memory,
+    cleanup_expired_messages,
+    reset_stale_processing,
+    queue_stats,
+)
 from orchestration.workflow import run_workflow
 import asyncio
 import tempfile
@@ -41,33 +46,92 @@ logging.basicConfig(level=logging.DEBUG)
 # Frontend directory (used for serving static files and index.html)
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 
+_MAINTENANCE_INTERVAL_S = int(os.environ.get("ORBIX_MAINTENANCE_INTERVAL_S", str(15 * 60)))
+
+
+def _run_maintenance():
+    """
+    Single shared maintenance routine (called by the scheduled loop below and by
+    POST /workflow/cleanup) — one code path, not two.
+
+    Order matters: drain any pending extract_queue rows into Neo4j FIRST (the durable
+    retry safety net for agent.py's fast per-turn extraction — if that fast path fails,
+    e.g. Neo4j briefly down, the row stays 'pending' here instead of the fact being
+    lost outright), and only THEN expire old SQLite messages. cleanup_expired_messages()
+    already refuses to delete a session with pending/processing extract_queue rows;
+    draining first is what makes that check actually meaningful.
+    """
+    try:
+        reset_stale_processing()  # crash recovery: anything stuck 'processing' -> 'pending'
+    except Exception as e:
+        logger.error(f"reset_stale_processing failed: {e}")
+
+    try:
+        from mcp_host import extractor
+        drain_result = extractor.drain_all()
+        logger.info(f"Maintenance drain: {drain_result}")
+    except Exception as e:
+        logger.error(f"extract_queue drain failed: {e}")
+
+    try:
+        cleanup_result = cleanup_expired_messages()
+        logger.info(f"Expired messages cleanup: {cleanup_result}")
+    except Exception as e:
+        logger.error(f"Cleanup failed: {e}")
+
+    # Repair any graph node that reached Neo4j without an identity key. `key` is the
+    # sole MERGE target for every memory write, so a keyless node is unreachable by
+    # recall() and can never be deduplicated — the next mention of the same entity
+    # creates a second node. Neo4j Community cannot enforce this at the database
+    # level (property-existence and node-key constraints are Enterprise-only), so
+    # the invariant is maintained here instead. Raw-Cypher writers have been fixed
+    # to set keys directly; this is the backstop for anything that regresses.
+    try:
+        from graph import memory as _mem
+        backfill_result = _mem.backfill_missing_keys()
+        if backfill_result.get("assigned") or backfill_result.get("relabeled"):
+            logger.info(f"Graph key backfill: {backfill_result}")
+    except Exception as e:
+        logger.error(f"Graph key backfill failed: {e}")
+
+
+async def _maintenance_loop():
+    """Background loop: periodically drain extract_queue, then expire old messages.
+    Runs for the app's lifetime; cancelled cleanly on shutdown via lifespan()."""
+    while True:
+        await asyncio.sleep(_MAINTENANCE_INTERVAL_S)
+        try:
+            await asyncio.to_thread(_run_maintenance)
+        except Exception as e:
+            logger.error(f"Maintenance loop iteration failed: {e}", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """On launch: ensure Ollama is serving, then drain any memory writes left
-    pending from a previous run (drain-on-startup). Initialize SQLite schema.
-    Never blocks fatally."""
+    """On launch: ensure Ollama is serving, initialize SQLite schema, start the
+    periodic maintenance loop. Never blocks fatally."""
     try:
         # Initialize SQLite working memory (creates tables if needed)
         init_working_memory()
         logger.info("Working memory SQLite initialized")
     except Exception as e:
         logger.error(f"Working memory init failed: {e}", exc_info=True)
-    
+
     try:
         from mcp_host import startup
         await asyncio.to_thread(startup.run_startup)
     except Exception as e:
         logger.error("Startup orchestration failed (continuing): %s", e, exc_info=True)
-    yield
 
-
-def _cleanup_expired_messages_bg():
-    """Daily cleanup: delete expired SQLite messages (24hr lifespan)."""
+    maintenance_task = asyncio.create_task(_maintenance_loop())
     try:
-        result = cleanup_expired_messages()
-        logger.info(f"Expired messages cleanup: {result}")
-    except Exception as e:
-        logger.error(f"Cleanup failed: {e}")
+        yield
+    finally:
+        maintenance_task.cancel()
+        try:
+            await maintenance_task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(lifespan=lifespan)
@@ -131,8 +195,12 @@ def extract_travel_calendar_events(itinerary: str, destination: str,
         for day_str, title in matches:
             day_num = int(day_str)
             event_date = base_date + timedelta(days=day_num - 1)
+            # Strip trailing markdown emphasis markers (e.g. "...Landmarks**" from
+            # a "**Day 1: ...Landmarks**" bold heading line) so they don't leak
+            # into the calendar event title.
+            clean_title = re.sub(r'[\*_#]+$', '', title.strip()).strip()
             events.append({
-                "title": f"Day {day_num}: {title.strip()[:70]}",
+                "title": f"Day {day_num}: {clean_title[:70]}",
                 "date": event_date.strftime("%Y-%m-%d"),
                 "time": "",
                 "description": f"Trip to {destination}",
@@ -204,6 +272,39 @@ def health_check():
     return {"message": "Orbii Backend API is running", "status": "ok"}
 
 
+@app.get("/memory/health")
+def memory_health():
+    """
+    Visibility into the two-tier memory pipeline: how many SQLite turns are still
+    waiting to be promoted into Neo4j (by status — pending/processing/failed), and
+    whether Neo4j itself is reachable. `failed` rows previously only surfaced as a
+    log line; they're counted here so a stuck extractor doesn't go unnoticed.
+    """
+    stats = queue_stats()
+    try:
+        from mcp_host import extractor
+        neo4j_reachable = extractor.mem_reachable()
+    except Exception as e:
+        neo4j_reachable = False
+        logger.error(f"memory_health: reachability check failed: {e}")
+
+    # Graph integrity: unkeyed nodes are silently unreachable and undedupable, and
+    # Community edition can't constrain against them — so surface the count rather
+    # than letting it drift unnoticed. Non-zero means some writer bypassed the
+    # keyed-upsert discipline; the maintenance loop repairs it on its next pass.
+    unkeyed = None
+    if neo4j_reachable:
+        try:
+            from graph import memory as _mem
+            unkeyed = _mem.count_unkeyed()
+        except Exception as e:
+            logger.error(f"memory_health: unkeyed count failed: {e}")
+
+    return {"queue": stats, "neo4j_reachable": neo4j_reachable,
+            "graph": {"unkeyed_entities": unkeyed,
+                      "healthy": (unkeyed == 0) if unkeyed is not None else None}}
+
+
 # ============ MCP INTEGRATIONS (enable/disable servers) ============
 # The frontend Integrations page reads and toggles the MCP server roster here.
 # Toggling only records intent in mcp_state.json; the agent picks up the enabled set
@@ -219,6 +320,36 @@ def mcp_list_servers():
     except Exception as e:
         logger.error(f"mcp_list_servers error: {e}", exc_info=True)
         return {"servers": [], "error": str(e)}
+
+
+@app.get("/model/list")
+def model_list():
+    """Catalog of known agent models + which one is active (for the model toggle UI)."""
+    try:
+        from llm import model_registry
+        return {"models": model_registry.list_models()}
+    except Exception as e:
+        logger.error(f"model_list error: {e}", exc_info=True)
+        return {"models": [], "error": str(e)}
+
+
+@app.post("/model/active")
+def model_set_active(payload: dict):
+    """
+    Switch the active agent model. Body: {"model": "llama3.1:8b"}.
+    Takes effect on the next agent turn — no restart needed (agent.py reads
+    the registry fresh each call, same pattern as the MCP server toggles).
+    """
+    try:
+        from llm import model_registry
+        model_id = (payload.get("model") or "").strip()
+        if not model_id:
+            return {"success": False, "error": "model is required"}
+        updated = model_registry.set_active(model_id)
+        return {"success": True, "model": updated}
+    except Exception as e:
+        logger.error(f"model_set_active error: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
 
 
 @app.post("/mcp/servers/{server_id}")
@@ -289,6 +420,7 @@ async def workflow_chat(message: dict):
                 pass
 
         register_progress_emitter(session_id, _emit_step)
+        task = None
         try:
             yield f'data: {json.dumps({"type": "thinking", "step": "Understanding your request…"})}\n\n'
 
@@ -325,6 +457,9 @@ async def workflow_chat(message: dict):
             emails = (mo.get("data") or {}).get("emails")
             if emails:
                 payload["emails"] = emails
+            elapsed = (mo.get("data") or {}).get("elapsed_seconds")
+            if elapsed is not None:
+                payload["elapsed_seconds"] = elapsed
 
             logger.info(f"[LangGraph] Workflow completed: module={module}, intent={intent}")
             yield f'data: {json.dumps(payload)}\n\n'
@@ -334,6 +469,14 @@ async def workflow_chat(message: dict):
             yield f'data: {json.dumps({"type": "error", "message": str(e)})}\n\n'
         finally:
             unregister_progress_emitter(session_id)
+            # If the client disconnected (tab closed, request timed out) before the
+            # workflow finished, `task` was left running orphaned in the background —
+            # confirmed live: a client-side timeout on a slow multi-tool turn didn't
+            # stop the server from continuing to call send_email/create_meet minutes
+            # after nobody was waiting on the result. GeneratorExit (client gone)
+            # still reaches this finally, so cancel anything still in flight.
+            if task is not None and not task.done():
+                task.cancel()
 
     return StreamingResponse(generate(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
@@ -343,11 +486,11 @@ async def workflow_chat(message: dict):
 @app.post("/workflow/cleanup")
 async def workflow_cleanup_now(background_tasks: BackgroundTasks):
     """
-    Manually trigger cleanup of expired SQLite messages (for testing).
-    Normally this would run on a schedule (daily).
+    Manually trigger the same drain+cleanup routine the scheduled maintenance loop
+    runs every ORBIX_MAINTENANCE_INTERVAL_S seconds (useful for on-demand testing/ops).
     """
-    background_tasks.add_task(_cleanup_expired_messages_bg)
-    return {"status": "cleanup queued"}
+    background_tasks.add_task(_run_maintenance)
+    return {"status": "maintenance queued"}
 
 
 
@@ -431,18 +574,28 @@ async def chat_stream(message: dict):
         return f"data: {json.dumps(obj)}\n\n"
 
     async def generate():
+        plan_task = agent_task = None
         try:
             yield _sse({"type": "thinking", "step": "Understanding your request…"})
             await asyncio.sleep(0)
 
-            # ── Intent classification (blocking → executor) ─────────────────
-            classification = await loop.run_in_executor(
-                None, IntentClassifier.classify, user_text
-            )
-            intent       = classification["intent"]
-            parameters   = classification.get("parameters", {})
-            email_content = classification.get("email_content", {})
-            travel_plan_pre = classification.get("travel_plan", {})
+            # ── Intent classification ────────────────────────────────────────
+            # Regex first (instant, no model call) — this only needs to decide
+            # travel vs. everything-else (every other label routes the same way
+            # below), and calling the separate fine-tuned classifier here on
+            # every turn was evicting the agent loop's warm model context (see
+            # PERFORMANCE_AUDIT.md item 3). Only escalates to that model when
+            # explicitly opted in via ORBIX_USE_LLM_ROUTER=1.
+            from orchestration.routing import _regex_route
+            intent, _confidence = _regex_route(user_text)
+            if os.environ.get("ORBIX_USE_LLM_ROUTER") == "1":
+                try:
+                    classification = await loop.run_in_executor(
+                        None, IntentClassifier.classify, user_text
+                    )
+                    intent = classification.get("intent") or intent
+                except Exception as e:
+                    logger.warning(f"LLM classifier failed ({e}); keeping regex result")
 
             intent_label = intent.replace("_", " ").title()
             yield _sse({"type": "thinking", "step": f"Intent detected: {intent_label}"})
@@ -561,6 +714,12 @@ async def chat_stream(message: dict):
         except Exception as e:
             logger.error("Stream chat error: %s", e, exc_info=True)
             yield _sse({"type": "error", "message": str(e)})
+        finally:
+            # Same orphaned-task risk as /workflow/chat if the client disconnects
+            # mid-turn — cancel whichever background task is still running.
+            for _t in (plan_task, agent_task):
+                if _t is not None and not _t.done():
+                    _t.cancel()
 
     return StreamingResponse(generate(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",

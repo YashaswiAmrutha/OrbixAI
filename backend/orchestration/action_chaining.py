@@ -52,8 +52,12 @@ class ActionChainExecutor:
         if any(w in query_lower for w in ["send email", "email", "mail", "message"]):
             intents.append("send_email")
 
-        # Meeting intentions
-        if any(w in query_lower for w in ["create meeting", "meeting", "schedule", "event", "calendar"]):
+        # Meeting intentions — NOT "calendar"/"event": those just mean "put this on my
+        # calendar," which is a create_calendar_event action, not a Google Meet. Confirmed
+        # live: "email me the plan, add it to my calendar" was misclassified as a meeting
+        # request and made the agent create an unrequested real Google Meet.
+        if any(w in query_lower for w in ["create meeting", "meeting", "schedule a call",
+                                          "video call", "gmeet", "google meet"]):
             intents.append("create_meeting")
 
         # Preference for execution mode
