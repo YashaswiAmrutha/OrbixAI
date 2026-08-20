@@ -24,6 +24,7 @@ import os
 import sys
 import json
 import logging
+import shutil
 from pathlib import Path
 from threading import Lock
 
@@ -33,6 +34,7 @@ _BACKEND = Path(__file__).resolve().parents[1]
 _SERVERS_DIR = _BACKEND / "mcp_servers"
 _STATE_FILE = _BACKEND / "mcp_state.json"
 _PY = sys.executable  # spawn every server with the exact interpreter running us
+_NPX = shutil.which("npx") or "npx"
 
 _lock = Lock()
 
@@ -115,6 +117,33 @@ CATALOG: list[dict] = [
         "steps": [
             "Enable the server",
             "Ask the assistant to look something up or summarise a URL",
+        ],
+    },
+    {
+        "id": "orbix-playwright",
+        "name": "Playwright Browser",
+        "category": "Web & actions",
+        "icon": "browser",
+        "description": "Open and interact with dynamic websites through Microsoft's "
+                       "Playwright MCP accessibility snapshots.",
+        "data": "Public web pages, clicks, forms and browser accessibility snapshots",
+        "auth": "Local browser — headless isolated session",
+        "requires": "local",
+        "default": True,
+        "locked": False,
+        "command": _NPX,
+        # Pin the locally verified package instead of checking the npm registry on
+        # every assistant turn. --isolated prevents cookies/history leaking between
+        # sessions; --headless keeps terminal-launched OrbixAI reliable.
+        "args": ["-y", "@playwright/mcp@0.0.77", "--headless", "--isolated",
+                 "--executable-path",
+                 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                 "--image-responses", "omit"],
+        "config": [],
+        "steps": [
+            "Node.js 18+ and Chromium must be installed",
+            "Enable the server",
+            "Ask OrbixAI to open a site, click controls, or fill a public form",
         ],
     },
     {

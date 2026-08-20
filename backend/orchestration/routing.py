@@ -18,6 +18,11 @@ logger = logging.getLogger(__name__)
 
 # Rule-based intent detection patterns
 _INTENT_PATTERNS = {
+    "flight_search": [
+        r"\b(?:flight|flights|airfare)\b.*\b(?:price|prices|cost|fare|fares|cheap|cheapest|available)\b",
+        r"\b(?:price|prices|cost|fare|fares|cheap|cheapest)\b.*\b(?:flight|flights|airfare)\b",
+        r"\b(?:search|find)\b.*\bflights?\b",
+    ],
     "send_email": [
         r"send\s+(?:an?\s+)?email",
         r"email\s+(?:to\s+)?[\w\-]+@[\w\-]+\.\w+",
@@ -31,14 +36,51 @@ _INTENT_PATTERNS = {
         r"plan\s+(?:a\s+)?(?:trip|travel|vacation)",
         r"(?:trip|travel|vacation)\s+to\s+\w+",
         r"where\s+should\s+i\s+(?:go|travel|visit)",
+        # Itinerary requests are travel planning even when the same sentence
+        # also asks for live flight prices. Travel planning is the superset: it
+        # can return both, whereas the fare-only fast path cannot make a plan.
+        r"\b(?:create|generate|make|build|prepare|suggest|give\s+me)?\s*(?:a\s+)?\d+\s*[- ]?\s*days?\s+(?:travel\s+)?itinerar(?:y|ies)\b",
+        r"\b(?:itinerar(?:y|ies)|tour\s+plan|travel\s+plan)\b",
+        r"\b(?:explore|visit|things\s+to\s+do|places\s+to\s+see)\b.*\b(?:day|days|itinerar(?:y|ies))\b",
     ],
     "create_meeting": [
-        r"(?:schedule|create|book)\s+(?:a\s+)?(?:meeting|call|hangout)",
+        r"(?:schedule|create|book|arrange|organize|set\s+up)\s+(?:a\s+)?(?:meet|meeting|call|hangout)",
         r"(?:meet|call)\s+(?:with\s+)?[\w\-]+@[\w\-]+\.\w+",
     ],
     "get_emails": [
         r"(?:show|get|retrieve)\s+(?:my\s+)?emails",
         r"(?:check|read)\s+(?:my\s+)?(?:inbox|mail)",
+    ],
+    "add_task": [
+        r"(?:add|create)\s+(?:a\s+)?(?:task|to-?do)",
+        r"remind\s+me\s+to\b",
+    ],
+    "complete_task": [
+        r"(?:complete|finish|mark)\s+.*(?:task|to-?do|done)",
+    ],
+    "list_tasks": [
+        r"(?:show|list|what(?:'s| is))\s+(?:my\s+)?(?:tasks|to-?dos)",
+    ],
+    "web_search": [
+        r"(?:search|look\s+up|find)\s+(?:the\s+)?(?:web|online|internet)\b",
+        r"^https?://",
+    ],
+    "browser_automation": [
+        r"\b(?:open|navigate|browse|visit)\b.*\b(?:website|site|page|https?://)",
+        r"\b(?:use|open)\s+(?:the\s+)?browser\b",
+        r"\b(?:click|fill|submit|type)\b.*\b(?:website|site|page|form|browser)\b",
+    ],
+    "file_read": [
+        r"(?:read|open|show|find|search)\s+.*\b(?:file|folder|document)\b",
+    ],
+    "file_write": [
+        r"(?:write|create|save|edit|update)\s+.*\b(?:file|document)\b",
+    ],
+    "calendar_read": [
+        r"(?:show|list|what(?:'s| is))\s+.*\bcalendar\b",
+    ],
+    "calendar_write": [
+        r"(?:add|create|book)\s+.*\b(?:calendar|event)\b",
     ],
 }
 
@@ -53,6 +95,16 @@ _MODULE_MAP = {
     "meeting_and_email": "chat",
     "schedule_meeting": "chat",
     "get_emails": "chat",
+    "add_task": "chat",
+    "complete_task": "chat",
+    "list_tasks": "chat",
+    "web_search": "chat",
+    "browser_automation": "chat",
+    "flight_search": "chat",
+    "file_read": "chat",
+    "file_write": "chat",
+    "calendar_read": "chat",
+    "calendar_write": "chat",
     "travel_planner": "travel",
     "general_chat": "chat",
 }
@@ -61,7 +113,21 @@ _MODULE_MAP = {
 def _regex_route(user_query: str):
     """Fallback rule-based detection. Returns (intent, confidence)."""
     ql = user_query.lower()
+    # A meeting request may also say "send an email invitation". Treat the
+    # compound request as meeting creation first so it reaches the verified
+    # meeting executor instead of being mistaken for a plain email.
+    for pattern in _INTENT_PATTERNS["create_meeting"]:
+        if re.search(pattern, ql, re.IGNORECASE):
+            return "create_meeting", 0.95
+    # A compound "flight prices + itinerary" request must run the full travel
+    # pipeline. Check planning before the fare-only patterns so no requested
+    # clause is silently discarded.
+    for pattern in _INTENT_PATTERNS["travel_planner"]:
+        if re.search(pattern, ql, re.IGNORECASE):
+            return "travel_planner", 0.95
     for intent, patterns in _INTENT_PATTERNS.items():
+        if intent in {"create_meeting", "travel_planner"}:
+            continue
         for pattern in patterns:
             if re.search(pattern, ql, re.IGNORECASE):
                 return intent, 0.95

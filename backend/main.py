@@ -16,6 +16,9 @@ from graph.working_memory import (
     cleanup_expired_messages,
     reset_stale_processing,
     queue_stats,
+    add_message,
+    get_messages,
+    start_session,
 )
 from orchestration.workflow import run_workflow
 import asyncio
@@ -26,8 +29,8 @@ from datetime import datetime, timedelta
 import logging
 import os
 
-# Force CPU-only mode to avoid CUDA library issues
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
+# Ollama uses the M1 Pro's Metal GPU automatically. Do not set num_gpu=0 or an
+# invalid visible-device override here; both force CPU inference.
 # Allow OAuth over HTTP for local development
 os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 
@@ -41,7 +44,12 @@ if _env_file.exists():
             os.environ.setdefault(_k.strip(), _v.strip())
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.DEBUG)
+# DEBUG logging from urllib3/httpcore prints full request URLs, including API
+# query parameters. Keep normal operational detail without leaking credentials
+# into the terminal.
+logging.basicConfig(level=logging.INFO)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # Frontend directory (used for serving static files and index.html)
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
@@ -269,7 +277,11 @@ def auth_callback(request: Request):
 
 @app.get("/health")
 def health_check():
-    return {"message": "Orbii Backend API is running", "status": "ok"}
+    return {
+        "message": "Orbii Backend API is running",
+        "status": "ok",
+        "build": "optimized-2026-08-20.3",
+    }
 
 
 @app.get("/memory/health")
@@ -588,6 +600,19 @@ async def chat_stream(message: dict):
             # explicitly opted in via ORBIX_USE_LLM_ROUTER=1.
             from orchestration.routing import _regex_route
             intent, _confidence = _regex_route(user_text)
+            effective_query = user_text
+            sid = (message.get("session_id") or "").strip() or None
+            if intent == "general_chat" and sid and re.fullmatch(
+                r"\s*(?:go ahead|continue|do it|yes|please do|proceed)[.!]?\s*",
+                user_text, re.I,
+            ):
+                for prior in reversed(get_messages(sid, limit=12)):
+                    if prior.get("role") != "user":
+                        continue
+                    prior_intent, _ = _regex_route(prior.get("text", ""))
+                    if prior_intent == "flight_search":
+                        intent, effective_query = prior_intent, prior["text"]
+                        break
             if os.environ.get("ORBIX_USE_LLM_ROUTER") == "1":
                 try:
                     classification = await loop.run_in_executor(
@@ -600,6 +625,22 @@ async def chat_stream(message: dict):
             intent_label = intent.replace("_", " ").title()
             yield _sse({"type": "thinking", "step": f"Intent detected: {intent_label}"})
             await asyncio.sleep(0)
+
+            if intent == "flight_search":
+                from orchestration.flight_fastpath import execute_flight_search
+
+                yield _sse({"type": "thinking", "step": "Searching live economy fares…"})
+                fare_result = await asyncio.to_thread(execute_flight_search, effective_query)
+                response = (fare_result or {}).get("response") or (
+                    "I couldn't parse that flight search. Please include origin, "
+                    "destination, and departure date."
+                )
+                sid = sid or start_session()
+                add_message(sid, "user", user_text)
+                add_message(sid, "assistant", response, enqueue=False)
+                yield _sse({"type": "response", "reply": response,
+                            "intent": intent, "session_id": sid})
+                return
 
             # ── travel_planner → dedicated MCP travel pipeline ───────────────
             # Travel keeps its own branch; everything else (general chat AND
@@ -688,10 +729,48 @@ async def chat_stream(message: dict):
             from mcp_host.agent import run_turn
             from orchestration.workflow import _calendar_events_from_trace
 
-            sid = (message.get("session_id") or "").strip() or None
             step_q = asyncio.Queue()
+            tool_scopes = {
+                "send_email": {"send_email", "recall", "search", "search_transcript"},
+                "create_meeting": {"create_meet", "recall", "search"},
+                "meeting_and_email": {"create_meet", "send_email", "recall", "search"},
+                "get_emails": {"list_emails"},
+                "add_task": {"add_task", "list_tasks"},
+                "complete_task": {"complete_task", "list_tasks"},
+                "list_tasks": {"list_tasks"},
+                "web_search": {"web_search", "fetch_url"},
+                "browser_automation": {
+                    "browser_navigate", "browser_snapshot", "browser_click",
+                    "browser_type", "browser_fill_form", "browser_select_option",
+                    "browser_press_key", "browser_wait_for", "browser_tabs",
+                    "browser_navigate_back", "browser_close",
+                },
+                "file_read": {"read_file", "list_directory", "search_files"},
+                "file_write": {"read_file", "write_file", "list_directory", "search_files"},
+                "calendar_read": {"list_calendar_events"},
+                "calendar_write": {"create_calendar_event", "list_calendar_events"},
+            }
+            server_scopes = {
+                "send_email": {"orbix-memory", "orbix-gsuite"},
+                "create_meeting": {"orbix-memory", "orbix-gsuite"},
+                "meeting_and_email": {"orbix-memory", "orbix-gsuite"},
+                "get_emails": {"orbix-gsuite"},
+                "add_task": {"orbix-tasks"},
+                "complete_task": {"orbix-tasks"},
+                "list_tasks": {"orbix-tasks"},
+                "web_search": {"orbix-web"},
+                "browser_automation": {"orbix-playwright"},
+                "file_read": {"orbix-files"},
+                "file_write": {"orbix-files"},
+                "calendar_read": {"orbix-gsuite"},
+                "calendar_write": {"orbix-gsuite"},
+            }
             agent_task = asyncio.ensure_future(
-                run_turn(user_text, session_id=sid, on_event=step_q.put))
+                run_turn(user_text, session_id=sid, on_event=step_q.put,
+                         allowed_tool_names=tool_scopes.get(intent),
+                         allowed_server_names=server_scopes.get(
+                             intent, {"orbix-memory"}
+                         )))
             # stream the agent's tool steps into the thinking bubble as they happen
             while not (agent_task.done() and step_q.empty()):
                 try:

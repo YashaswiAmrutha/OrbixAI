@@ -45,7 +45,10 @@ class ActionChainExecutor:
         query_lower = user_query.lower()
 
         # Travel intentions
-        if any(w in query_lower for w in ["trip", "travel", "vacation", "destination", "hotel", "flight"]):
+        if any(w in query_lower for w in [
+            "trip", "travel", "vacation", "destination", "hotel", "flight",
+            "itinerary", "itineraries", "explore", "places to see", "things to do",
+        ]):
             intents.append("travel_planner")
 
         # Email intentions

@@ -1566,11 +1566,19 @@ async function initModelSelect() {
   const sel = document.getElementById("model-select");
   if (!sel) return;
   try {
-    const { models } = await (await fetch(`${API_BASE}/model/list`)).json();
-    sel.innerHTML = (models || [])
-      .map(m => `<option value="${m.id}" ${m.active ? "selected" : ""}>${m.label || m.id}</option>`)
-      .join("");
-  } catch (_) { /* backend not up yet — leave the select empty */ }
+    const response = await fetch(`${API_BASE}/model/list`);
+    if (!response.ok) throw new Error(`Model list returned HTTP ${response.status}`);
+    const { models } = await response.json();
+    // Never replace the built-in catalog with an empty response. This keeps the
+    // selector useful while Uvicorn is starting or temporarily unavailable.
+    if (Array.isArray(models) && models.length) {
+      sel.innerHTML = models
+        .map(m => `<option value="${m.id}" ${m.active ? "selected" : ""}>${m.label || m.id}</option>`)
+        .join("");
+    }
+  } catch (error) {
+    console.warn("Could not refresh model list; using built-in options.", error);
+  }
 
   sel.addEventListener("change", async () => {
     const model = sel.value;

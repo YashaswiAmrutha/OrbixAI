@@ -4,10 +4,12 @@ import sys
 import logging
 import requests
 import traceback
+import re
+from collections import Counter
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List
 
-from serpapi import GoogleSearch
+from llm.ollama_options import ollama_options
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +37,76 @@ IATA_CODES = {
     "Hyderabad": "HYD",
     "Kolkata": "CCU",
     "Srinagar": "SXR",
+    "Kashmir": "SXR",
     "Srinagar, Kashmir": "SXR"
 }
+
+_IATA_CACHE: dict[str, str | None] = {}
+
+
+def _serpapi_json(params: dict) -> dict:
+    """Call SerpAPI with an explicit network deadline."""
+    timeout = float(os.environ.get("ORBIX_SERPAPI_TIMEOUT_S", "12"))
+    response = requests.get(
+        "https://serpapi.com/search.json",
+        params=params,
+        timeout=(5, timeout),
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("error"):
+        raise RuntimeError(str(payload["error"]))
+    return payload
+
+
+def resolve_iata_code(place: str) -> Optional[str]:
+    """Resolve an arbitrary city/airport name to an IATA code.
+
+    The Google Flights endpoint requires an IATA code or Google location ID; a
+    raw city string often produces an empty result with no error. Known codes
+    stay instant, while unknown cities are resolved through the already
+    configured SerpAPI Google search and cached for the life of the backend.
+    """
+    place = (place or "").split(",")[0].strip()
+    if not place:
+        return None
+    if re.fullmatch(r"[A-Za-z]{3}", place):
+        return place.upper()
+
+    key = place.casefold()
+    known = {name.casefold(): code for name, code in IATA_CODES.items()}
+    if key in known:
+        return known[key]
+    if key in _IATA_CACHE:
+        return _IATA_CACHE[key]
+
+    params = {
+        "engine": "google",
+        "q": f"{place} main commercial airport IATA code",
+        "hl": "en",
+        "api_key": SERPAPI_KEY,
+    }
+    try:
+        payload = _serpapi_json(params)
+        candidates: list[str] = []
+        for row in (payload.get("organic_results") or [])[:5]:
+            text = f"{row.get('title', '')} {row.get('snippet', '')}"
+            for pattern in (
+                r"\bIATA(?:\s+(?:airport\s+)?code)?\s*[:\-]?\s*([A-Z]{3})\b",
+                r"\(([A-Z]{3})\)\s*(?:is|,|\-|airport)",
+                r"\bairport\s+code\s+(?:is\s+|for\s+[^—-]+[—-]\s*)?([A-Z]{3})\b",
+            ):
+                match = re.search(pattern, text, re.I)
+                if match:
+                    candidates.append(match.group(1).upper())
+                    break
+        code = Counter(candidates).most_common(1)[0][0] if candidates else None
+        _IATA_CACHE[key] = code
+        logger.info("Resolved airport location %r -> %s", place, code or "not found")
+        return code
+    except Exception as exc:
+        logger.warning("Airport-code resolution failed for %r: %s", place, exc)
+        return None
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 3. AMADEUS  (flights + hotels)
@@ -88,11 +158,11 @@ def search_flights(from_city: str, to_city: str,
 
     print("ENTERED search_flights()")
 
-    from_city = from_city.split(",")[0].strip()
-    to_city = to_city.split(",")[0].strip()
-
-    origin = IATA_CODES.get(from_city, from_city)
-    destination = IATA_CODES.get(to_city, to_city)
+    origin = resolve_iata_code(from_city)
+    destination = resolve_iata_code(to_city)
+    if not origin or not destination:
+        logger.warning("Cannot search flights: unresolved route %r -> %r", from_city, to_city)
+        return []
 
     params = {
         "engine": "google_flights",
@@ -100,14 +170,15 @@ def search_flights(from_city: str, to_city: str,
         "arrival_id": destination,
         "outbound_date": departure_date,
         "type": "2",
+        "travel_class": "1",
+        "adults": adults,
         "currency": "INR",
         "hl": "en",
         "api_key": SERPAPI_KEY,
     }
 
     try:
-        search = GoogleSearch(params)
-        results = search.get_dict()
+        results = _serpapi_json(params)
 
         flights = []
 
@@ -339,10 +410,37 @@ def _fallback_itinerary(city: str, attractions: List[Dict], num_days: int) -> st
     return "\n".join(lines).strip()
 
 
+def _itinerary_day_numbers(text: str) -> set[int]:
+    """Return every explicit Day N heading present in an itinerary."""
+    return {
+        int(value)
+        for value in re.findall(
+            r"(?im)^\s*(?:#{1,6}\s*)?(?:\*{1,2})?day\s+(\d+)\b",
+            text or "",
+        )
+    }
+
+
+def _fallback_day_sections(city: str, attractions: List[Dict], num_days: int,
+                           wanted: set[int]) -> str:
+    """Extract only missing day sections from the deterministic fallback."""
+    fallback = _fallback_itinerary(city, attractions, num_days)
+    matches = list(re.finditer(r"(?im)^day\s+(\d+)\b", fallback))
+    sections = []
+    for index, match in enumerate(matches):
+        day = int(match.group(1))
+        if day not in wanted:
+            continue
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(fallback)
+        sections.append(fallback[match.start():end].strip())
+    return "\n\n".join(sections)
+
+
 def generate_itinerary(city: str, attractions: List[Dict], num_days: int,
                        check_in: str, num_adults: int = 1,
                        flight_summary: str = None,
                        hotel_summary: str = None) -> str:
+    num_days = max(1, min(int(num_days or 1), 30))
     attractions_text = "\n".join(
         f"- {a['name']} ({a['category']})"
         for a in attractions[:15]
@@ -361,8 +459,11 @@ def generate_itinerary(city: str, attractions: List[Dict], num_days: int,
         f"You are an expert travel planner. Create a detailed {num_days}-day itinerary for {city}.\n\n"
         f"TRIP DETAILS:\n" + "\n".join(ctx_parts) + "\n\n"
         f"AVAILABLE ATTRACTIONS:\n{attractions_text}\n\n"
-        "INSTRUCTIONS: Create Day-by-Day plan with timings, meals, and travel tips. "
-        "Group nearby attractions. Mix activity types. Keep it realistic and enjoyable.\n\n"
+        "INSTRUCTIONS: Include every heading from Day 1 through Day "
+        f"{num_days}; never stop before the final day. Under each day use 4-6 concise "
+        "bullets covering morning, lunch, afternoon, and evening. Keep each day under "
+        "90 words. Include useful timings and meal suggestions, group nearby places, "
+        "and avoid a long introduction or conclusion.\n\n"
         "ITINERARY:"
     )
 
@@ -371,15 +472,63 @@ def generate_itinerary(city: str, attractions: List[Dict], num_days: int,
     # would break the MCP itinerary round-trip.
     try:
         import ollama
-        model = os.environ.get("ORBIX_TRAVEL_MODEL", "llama3.1:8b")  # see travel_planner.py note
+        from llm.model_registry import get_instruction_model
+        model = get_instruction_model()
+        # This is an output-token ceiling, not a requested length. Scale it with
+        # the requested duration so a four-day plan cannot be cut off by the same
+        # fixed budget used for a one-day plan.
+        output_budget = max(900, min(3800, 200 + (120 * num_days)))
         resp = ollama.chat(
             model=model,
             messages=[{"role": "user", "content": prompt}],
-            options={"temperature": 0.6, "num_predict": 900,
-                     "num_gpu": int(os.environ.get("OLLAMA_NUM_GPU", "0"))},
+            options=ollama_options(
+                temperature=0.5, num_predict=output_budget, num_ctx=8192
+            ),
         )
         text = (resp.get("message", {}).get("content") or "").strip()
         if text:
+            expected = set(range(1, num_days + 1))
+            missing = expected - _itinerary_day_numbers(text)
+            if missing:
+                logger.warning(
+                    "[Travel] itinerary omitted days %s; requesting continuation",
+                    sorted(missing),
+                )
+                continuation_prompt = (
+                    f"Continue this {num_days}-day {city} itinerary. Produce ONLY the "
+                    f"missing days: {', '.join(f'Day {d}' for d in sorted(missing))}. "
+                    "Use one heading per day and 4-6 concise bullets covering morning, "
+                    "lunch, afternoon, and evening. Do not repeat completed days.\n\n"
+                    f"EXISTING ITINERARY:\n{text}"
+                )
+                try:
+                    continuation = ollama.chat(
+                        model=model,
+                        messages=[{"role": "user", "content": continuation_prompt}],
+                        options=ollama_options(
+                            temperature=0.4,
+                            num_predict=max(600, min(2400, 180 * len(missing))),
+                            num_ctx=8192,
+                        ),
+                    )
+                    extra = (
+                        continuation.get("message", {}).get("content") or ""
+                    ).strip()
+                    if extra:
+                        text = text.rstrip() + "\n\n" + extra
+                except Exception as continuation_error:
+                    logger.warning(
+                        "[Travel] itinerary continuation failed: %s",
+                        continuation_error,
+                    )
+
+                # Never return a structurally incomplete plan. If the model still
+                # omitted a requested day, append deterministic day sections.
+                still_missing = expected - _itinerary_day_numbers(text)
+                if still_missing:
+                    text += "\n\n" + _fallback_day_sections(
+                        city, attractions, num_days, still_missing
+                    )
             return text
         logger.warning("[Travel] LLM returned empty itinerary; using deterministic fallback")
     except Exception as e:

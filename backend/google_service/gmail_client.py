@@ -26,13 +26,19 @@ SCOPES = ['https://www.googleapis.com/auth/gmail.modify',
 _EMAIL_CACHE_TTL = 25  # seconds — slightly less than the 30s auto-refresh interval
 
 class GmailClient:
-    def __init__(self, credentials_file='credentials.json', token_file='token.json', redirect_uri='http://127.0.0.1:8001/auth/callback'):
+    def __init__(self, credentials_file='credentials.json', token_file='token.json', redirect_uri=None):
         self.service = None
         self.calendar_service = None
         self.credentials = None
         self.credentials_file = credentials_file
         self.token_file = token_file
-        self.redirect_uri = redirect_uri
+        # `uvicorn main:app` listens on port 8000 by default. Allow deployments
+        # to override the callback while keeping the local development command
+        # and the redirect URI registered in Google Cloud in sync.
+        self.redirect_uri = redirect_uri or os.environ.get(
+            'GOOGLE_REDIRECT_URI',
+            'http://127.0.0.1:8000/auth/callback'
+        )
         self._flow = None
         # In-memory email cache (avoids repeated full fetches on every 30s auto-refresh)
         self._email_cache = None
@@ -70,9 +76,30 @@ class GmailClient:
             return False
 
     def _build_services(self):
-        """Build Gmail and Calendar API services using google-auth credentials directly."""
-        self.service          = build('gmail',    'v1', credentials=self.credentials)
-        self.calendar_service = build('calendar', 'v3', credentials=self.credentials)
+        """Build Gmail and Calendar clients with bounded network requests.
+
+        googleapiclient's default httplib2 transport has no request timeout. A slow
+        Calendar/Gmail connection could therefore hold a chat turn for minutes even
+        though no model inference was involved. Give each service its own authorized
+        transport and a configurable fail-fast timeout.
+        """
+        import httplib2
+        import google_auth_httplib2
+
+        timeout = float(os.environ.get("ORBIX_GOOGLE_TIMEOUT_S", "15"))
+
+        def _authorized_http():
+            return google_auth_httplib2.AuthorizedHttp(
+                self.credentials,
+                http=httplib2.Http(timeout=timeout),
+            )
+
+        self.service = build(
+            'gmail', 'v1', http=_authorized_http(), cache_discovery=False
+        )
+        self.calendar_service = build(
+            'calendar', 'v3', http=_authorized_http(), cache_discovery=False
+        )
         logger.info("Gmail and Calendar services initialized successfully")
 
     def _save_token(self):
@@ -362,25 +389,31 @@ class GmailClient:
             logger.error(f"An error occurred: {error}")
             return {'success': False, 'error': str(error)}
 
-    def create_google_meet(self, event_title, event_description, attendee_email, start_time=None):
+    def create_google_meet(self, event_title, event_description, attendee_email,
+                           start_time=None, duration_minutes=60):
         """Create a Google Calendar event with Google Meet link"""
         try:
             from datetime import datetime, timedelta
 
             if not start_time:
-                start_time = datetime.utcnow() + timedelta(hours=1)
-            end_time = start_time + timedelta(hours=1)
+                start_time = datetime.now().astimezone() + timedelta(hours=1)
+            if isinstance(start_time, str):
+                start_time = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+            if start_time.tzinfo is None:
+                start_time = start_time.astimezone()
+            duration_minutes = max(5, int(duration_minutes or 60))
+            end_time = start_time + timedelta(minutes=duration_minutes)
 
             event = {
                 'summary': event_title,
                 'description': event_description,
                 'start': {
-                    'dateTime': start_time.isoformat() + 'Z',
-                    'timeZone': 'UTC',
+                    'dateTime': start_time.isoformat(),
+                    'timeZone': 'Asia/Kolkata',
                 },
                 'end': {
-                    'dateTime': end_time.isoformat() + 'Z',
-                    'timeZone': 'UTC',
+                    'dateTime': end_time.isoformat(),
+                    'timeZone': 'Asia/Kolkata',
                 },
                 'conferenceData': {
                     'createRequest': {
@@ -398,7 +431,10 @@ class GmailClient:
             created_event = self.calendar_service.events().insert(
                 calendarId='primary',
                 body=event,
-                conferenceDataVersion=1
+                conferenceDataVersion=1,
+                # Calendar sends the attendee its standard invitation, including
+                # the Meet URL, without a second Gmail API round trip.
+                sendUpdates='all',
             ).execute()
 
             meet_link = created_event.get('conferenceData', {}).get('entryPoints', [{}])[0].get('uri', 'N/A')
