@@ -108,7 +108,14 @@
           </div>
         </div>
         <div class="nav-controls">
-          <select class="ctrl-select" id="model-select" title="Active agent model" aria-label="Active agent model"></select>
+          <select class="ctrl-select" id="model-select" title="Active agent model" aria-label="Active agent model">
+            <!-- Keep a usable local catalog in the page itself. JavaScript refreshes
+                 the active state from /model/list when the backend is available. -->
+            <option value="mistral:latest">Local — Mistral 7B</option>
+            <option value="llama3.1:8b">Base — Llama 3.1 8B</option>
+            <option value="gpraneeth555/llama-3-13k:latest">Fine-tuned — gpraneeth555/Llama-3-13k</option>
+            <option value="qwen3.5:9b">Qwen 3.5 9B</option>
+          </select>
           <button class="ctrl-btn" id="new-chat-btn" title="New chat" aria-label="Start a new chat">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M12 20h9"></path>
@@ -321,6 +328,6 @@
   </div>
   <div class="modal-overlay" id="event-modal-overlay"></div>
 
-  <script src="/static/script.js?v=19"></script>
+  <script src="/static/script.js?v=20"></script>
 </body>
 </html>

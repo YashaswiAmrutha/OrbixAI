@@ -27,6 +27,7 @@ Run (stdio transport — how the host spawns it):
     python backend/mcp_servers/gsuite_server.py
 """
 
+import os
 import re
 import sys
 from pathlib import Path
@@ -227,12 +228,21 @@ def send_email(recipient_email: str = "", subject: str = "", body: str = "",
     if not client:
         return _NEEDS_AUTH
     if not subject or not body:
-        content = MailGenerator.generate_mail_content(
-            user_prompt or subject or f"Message to {recipient_email}",
-            recipient_name=recipient_email.split("@")[0],
-        )
-        subject = subject or content.get("subject", "")
-        body = body or content.get("body", "")
+        # Do not launch a second local-model inference inside an already-running
+        # agent turn just to fill a missing email field. That doubled or tripled
+        # action latency on slower models. The agent normally supplies both; this
+        # deterministic fallback remains truthful and can be explicitly replaced
+        # by the older LLM drafting behavior when desired.
+        if os.environ.get("ORBIX_LLM_EMAIL_DRAFT", "0") == "1":
+            content = MailGenerator.generate_mail_content(
+                user_prompt or subject or f"Message to {recipient_email}",
+                recipient_name=recipient_email.split("@")[0],
+            )
+            subject = subject or content.get("subject", "")
+            body = body or content.get("body", "")
+        else:
+            subject = subject or "Message from OrbixAI"
+            body = body or (user_prompt or f"Message for {recipient_email}")
     # Guarantee a supplied Meet link lands in the email, even if the body was drafted
     # without it. Coerce defensively — a small model may pass a non-string here.
     meet_link = meet_link.strip() if isinstance(meet_link, str) else ""
@@ -249,7 +259,8 @@ def send_email(recipient_email: str = "", subject: str = "", body: str = "",
 
 @mcp.tool(annotations=_ACTION)
 def create_meet(attendee_email: str, event_title: str = "Meeting",
-                event_description: str = "", email_link_to: str = "") -> dict:
+                event_description: str = "", email_link_to: str = "",
+                start_time: str = "", duration_minutes: int = 60) -> dict:
     """
     Create a Google Meet (with calendar invite) for attendee_email and return
     {meet_link, event_id, event_title, attendee_email}.
@@ -265,7 +276,11 @@ def create_meet(attendee_email: str, event_title: str = "Meeting",
     client = _client()
     if not client:
         return _NEEDS_AUTH
-    result = client.create_google_meet(event_title, event_description, attendee_email)
+    result = client.create_google_meet(
+        event_title, event_description, attendee_email,
+        start_time=start_time or None,
+        duration_minutes=duration_minutes,
+    )
     if not result.get("success"):
         return {"error": result.get("error", "meet creation failed")}
     meet_link = result.get("meet_link")

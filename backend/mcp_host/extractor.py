@@ -29,6 +29,7 @@ import threading
 from pathlib import Path
 
 import ollama
+from llm.ollama_options import ollama_options
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "graph"))
 import working_memory as wm   # type: ignore  # noqa: E402
@@ -42,7 +43,7 @@ logger = logging.getLogger(__name__)
 # fell through to the empty-result path, meaning background memory extraction
 # (durable facts written to Neo4j after each turn) was never actually running.
 EXTRACT_MODEL = os.environ.get("ORBIX_EXTRACT_MODEL", "llama3.1:8b")
-_OPTIONS = {"temperature": 0.0, "num_gpu": int(os.environ.get("OLLAMA_NUM_GPU", "0"))}
+_OPTIONS = ollama_options(temperature=0.0, num_predict=256, num_ctx=2048)
 
 # JSON schema constraining the extractor's output (Ollama structured output).
 _EXTRACT_SCHEMA = {

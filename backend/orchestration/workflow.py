@@ -225,6 +225,85 @@ async def chat_node(state: OrbixState) -> OrbixState:
     user_query = state["user_query"]
 
     try:
+        # Live fare questions use the existing Google Flights provider directly.
+        # This avoids a slow model round-trip and prevents narrated/fake web calls.
+        effective_flight_query = user_query
+        if state.get("intent") == "general_chat" and re.fullmatch(
+            r"\s*(?:go ahead|continue|do it|yes|please do|proceed)[.!]?\s*",
+            user_query, re.I,
+        ):
+            from orchestration.routing import _regex_route
+            for prior in reversed(state.get("transcript", [])):
+                if prior.get("role") == "user" and _regex_route(prior.get("text", ""))[0] == "flight_search":
+                    state["intent"] = "flight_search"
+                    effective_flight_query = prior["text"]
+                    break
+
+        if state.get("intent") == "flight_search":
+            from orchestration.flight_fastpath import execute_flight_search
+
+            _emit(state, "Searching live economy fares…")
+            fare_result = await asyncio.to_thread(execute_flight_search, effective_flight_query)
+            if fare_result and fare_result.get("handled"):
+                response = fare_result["response"]
+                user_msg_id = add_message(session_id, "user", user_query)
+                add_message(session_id, "assistant", response, enqueue=False)
+                state["module_output"] = {
+                    "response": response,
+                    "module": "flight_search",
+                    "data": {"flights": fare_result.get("flights", []), "trace_steps": 1},
+                }
+                state["extraction_tasks"].append({
+                    "type": "extract_from_turn", "user_text": user_query,
+                    "assistant_text": response, "session_id": session_id,
+                    "user_msg_id": user_msg_id,
+                })
+                state["step"] = "chat_node"
+                return state
+
+        # Explicit, fully specified meeting requests take a deterministic path.
+        # This prevents small local models from fabricating tool-result placeholders
+        # or inventing the requested date/time while still leaving ambiguous requests
+        # to the conversational agent for clarification.
+        if state.get("intent") == "create_meeting":
+            from orchestration.meeting_fastpath import execute_explicit_meeting
+
+            _emit(state, "Creating the scheduled meeting…")
+            previous_user_turns = [
+                m.get("text", "") for m in state.get("transcript", [])
+                if m.get("role") == "user" and m.get("text")
+            ]
+            fast = await asyncio.to_thread(
+                execute_explicit_meeting, user_query, previous_user_turns
+            )
+            if fast and fast.get("handled"):
+                if fast.get("error"):
+                    response = f"I couldn't create the meeting: {fast['error']}"
+                else:
+                    response = fast["response"]
+                    state["calendar_events"] = [fast["meeting"]]
+                    state["todo_items"] = [{
+                        "text": f"Prepare for: {fast['meeting']['title']}",
+                        "source": "ai_meeting",
+                    }]
+
+                user_msg_id = add_message(session_id, "user", user_query)
+                add_message(session_id, "assistant", response, enqueue=False)
+                state["module_output"] = {
+                    "response": response,
+                    "module": "meeting_fastpath",
+                    "data": {"trace_steps": 1 if not fast.get("error") else 0},
+                }
+                state["extraction_tasks"].append({
+                    "type": "extract_from_turn",
+                    "user_text": user_query,
+                    "assistant_text": response,
+                    "session_id": session_id,
+                    "user_msg_id": user_msg_id,
+                })
+                state["step"] = "chat_node"
+                return state
+
         _emit(state, "Thinking…")
         logger.info(f"Chat node: calling agent.run_turn() for '{user_query[:50]}...'")
 
@@ -237,7 +316,62 @@ async def chat_node(state: OrbixState) -> OrbixState:
             if step:
                 _emit(state, step)
 
-        result = await run_turn(user_query, session_id=session_id, on_event=_on_event)
+        # Keep small local models focused: expose only tools relevant to the
+        # routed intent. The old all-tools prompt overwhelmed Mistral and caused
+        # placeholder prose instead of real calls.
+        tool_scopes = {
+            "send_email": {"send_email", "recall", "search", "search_transcript"},
+            "get_emails": {"list_emails"},
+            "add_task": {"add_task", "list_tasks"},
+            "complete_task": {"complete_task", "list_tasks"},
+            "list_tasks": {"list_tasks"},
+            "web_search": {"web_search", "fetch_url"},
+            "browser_automation": {
+                "browser_navigate", "browser_snapshot", "browser_click",
+                "browser_type", "browser_fill_form", "browser_select_option",
+                "browser_press_key", "browser_wait_for", "browser_tabs",
+                "browser_navigate_back", "browser_close",
+            },
+            "flight_search": {"web_search", "fetch_url"},
+            "file_read": {"read_file", "list_directory", "search_files"},
+            "file_write": {"read_file", "write_file", "list_directory", "search_files"},
+            "calendar_read": {"list_calendar_events"},
+            "calendar_write": {"create_calendar_event", "list_calendar_events"},
+        }
+        server_scopes = {
+            "send_email": {"orbix-memory", "orbix-gsuite"},
+            "create_meeting": {"orbix-memory", "orbix-gsuite"},
+            "meeting_and_email": {"orbix-memory", "orbix-gsuite"},
+            "get_emails": {"orbix-gsuite"},
+            "add_task": {"orbix-tasks"},
+            "complete_task": {"orbix-tasks"},
+            "list_tasks": {"orbix-tasks"},
+            "web_search": {"orbix-web"},
+            "browser_automation": {"orbix-playwright"},
+            "flight_search": {"orbix-web"},
+            "file_read": {"orbix-files"},
+            "file_write": {"orbix-files"},
+            "calendar_read": {"orbix-gsuite"},
+            "calendar_write": {"orbix-gsuite"},
+        }
+        default_read_tools = {
+            "recall", "search", "get_entity", "search_transcript",
+            "list_emails", "list_calendar_events", "list_tasks",
+            "web_search", "fetch_url", "read_file", "list_directory",
+            "search_files", "drive_search", "drive_list_recent", "drive_read_file",
+        }
+        allowed_tools = tool_scopes.get(state.get("intent"), default_read_tools)
+        result = await run_turn(
+            user_query,
+            session_id=session_id,
+            on_event=_on_event,
+            allowed_tool_names=allowed_tools,
+            # General chat only needs memory. Structured intents start their one
+            # relevant MCP integration instead of every enabled subprocess.
+            allowed_server_names=server_scopes.get(
+                state.get("intent"), {"orbix-memory"}
+            ),
+        )
 
         response = result.get("reply", "I couldn't generate a response")
         trace = result.get("trace", [])
@@ -411,7 +545,14 @@ async def travel_node(state: OrbixState) -> OrbixState:
                 )
                 agent_out = await _agent_run_turn(followup_instruction,
                                                   session_id=f"{session_id}:followup",
-                                                  max_steps=6, on_event=_followup_event)
+                                                  max_steps=4,
+                                                  on_event=_followup_event,
+                                                  allowed_tool_names={
+                                                      "send_email", "recall", "search"
+                                                  },
+                                                  allowed_server_names={
+                                                      "orbix-memory", "orbix-gsuite"
+                                                  })
                 followup_reply = (agent_out.get("reply") or "").strip()
                 if followup_reply:
                     response = response + "\n\n" + followup_reply

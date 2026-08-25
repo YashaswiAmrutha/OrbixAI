@@ -10,12 +10,13 @@ The fine-tuned model (gpraneeth555/Llama-3-13k) returns tool calls in the form:
 This module parses those tool calls and maps them to OrbixAI's internal
 intent schema so the existing workflow pipeline stays untouched.
 
-Fallback chain:  fine-tuned model → llama3.1:8b → safe default
+Fallback chain:  fine-tuned model → installed local model → safe default
 """
 
 import json
 import re
 import logging
+from llm.ollama_options import ollama_options
 
 logger = logging.getLogger(__name__)
 
@@ -24,11 +25,13 @@ ORCHESTRATOR_MODEL = "gpraneeth555/Llama-3-13k:latest"
 # llama3.2:latest (no "3b" tag), so the old "llama3.2:3b" here silently broke
 # this fallback (model-not-found) any time the fine-tuned model errored,
 # contradicting this function's own docstring ("falls back to llama3.1:8b").
-FALLBACK_MODEL     = "llama3.1:8b"
+# Keep this fallback aligned with a model that is actually installed locally.
+# Mistral also supports Ollama's native tool schema, unlike the older llama3 tag.
+FALLBACK_MODEL     = "mistral:latest"
 
-# ── GPU workaround: model must run on CPU (CUDA runtime issue on this machine) ─
-_OLLAMA_OPTIONS = {"temperature": 0.1, "num_predict": 1024, "num_gpu": 0}
-_CHAT_OPTIONS   = {"temperature": 0.7, "num_predict": 512,  "num_gpu": 0}
+# Leave num_gpu unset so Ollama auto-selects Metal on Apple Silicon.
+_OLLAMA_OPTIONS = ollama_options(temperature=0.1, num_predict=1024, num_ctx=4096)
+_CHAT_OPTIONS   = ollama_options(temperature=0.7, num_predict=1024, num_ctx=4096)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -344,7 +347,7 @@ def orchestrate(user_query: str) -> dict:
 def chat_response(user_query: str) -> str:
     """
     Generate a plain-text conversational reply.
-    Uses fine-tuned model first, falls back to llama3.1:8b.
+    Uses the fine-tuned model first, then the installed local fallback.
     """
     import ollama
 

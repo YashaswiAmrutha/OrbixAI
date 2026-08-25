@@ -41,7 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "graph"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "llm"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from client import MCPClientManager  # type: ignore  # noqa: E402
+from client import MCPClientManager, default_servers  # type: ignore  # noqa: E402
 import working_memory as wm  # type: ignore  # noqa: E402
 import legacy_tool_adapter  # type: ignore  # noqa: E402
 import model_registry  # type: ignore  # noqa: E402
@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 # .env's explicit ORBIX_AGENT_MODEL=llama3.1:8b, but fixed here too so this
 # module still works correctly if ever run without that override.
 AGENT_MODEL = os.environ.get("ORBIX_AGENT_MODEL", "llama3.1:8b")
-MAX_STEPS = int(os.environ.get("ORBIX_AGENT_MAX_STEPS", "8"))
+MAX_STEPS = int(os.environ.get("ORBIX_AGENT_MAX_STEPS", "4"))
 # How long Ollama keeps this model (+ its KV cache) resident after the last call.
 # Ollama's own default is 5m; measured on this machine, reprocessing the ~20-28
 # enabled-tool schemas from a cold/evicted context costs ~90-110s on CPU alone
@@ -75,15 +75,16 @@ except ValueError:
 # Every OTHER enabled server's action tools (gsuite, files, tasks, …) are fair game,
 # so the brain can act across any combination of connected integrations.
 _MEMORY_SERVER = "orbix-memory"
-# Match the project's CPU-only Ollama setup (CUDA issues on this machine).
-_OPTIONS = {
-    "temperature": 0.2,
-    "num_gpu": int(os.environ.get("OLLAMA_NUM_GPU", "0")),
+from llm.ollama_options import ollama_options
+
+# Ollama auto-selects the Apple Metal backend when num_gpu is omitted.
+_OPTIONS = ollama_options(
+    temperature=0.2,
     # Cap generation length per step — unset previously, so a single step could
     # in principle generate unboundedly long output, adding pure CPU eval time
     # on every step of an already multi-step loop. 512 is generous for a tool
     # call or a concise reply; matches the cap already used elsewhere (hf_client).
-    "num_predict": int(os.environ.get("ORBIX_AGENT_NUM_PREDICT", "512")),
+    num_predict=int(os.environ.get("ORBIX_AGENT_NUM_PREDICT", "1024")),
     # Ollama's runtime context window defaults to 4096 regardless of the model's
     # true capability (llama3.1:8b supports up to 131072) — confirmed via
     # `ollama ps` reporting context_length: 4096. The tool schemas alone for a
@@ -94,8 +95,8 @@ _OPTIONS = {
     # can drop the system prompt/original user question entirely, producing
     # replies like "I don't see any user input or request." Raised well above
     # the observed tool-schema + multi-step overhead.
-    "num_ctx": int(os.environ.get("ORBIX_AGENT_NUM_CTX", "8192")),
-}
+    num_ctx=int(os.environ.get("ORBIX_AGENT_NUM_CTX", "4096")),
+)
 
 _OWNER = "user:self"
 # main.py's lifespan already runs wm.init_db() once at startup before serving any
@@ -251,7 +252,10 @@ def _format_context(recall: dict | None) -> str:
 def _messages_from_session(session_id: str, context: str = "") -> list[dict]:
     """System prompt (+ pre-loaded memory context) + recent transcript."""
     msgs = [{"role": "system", "content": _system_prompt() + context}]
-    for m in wm.get_messages(session_id, limit=20):
+    # Ten recent messages preserve normal follow-ups while avoiding repeated prompt
+    # evaluation over an ever-growing transcript on local models.
+    history_limit = int(os.environ.get("ORBIX_AGENT_HISTORY_MESSAGES", "10"))
+    for m in wm.get_messages(session_id, limit=history_limit):
         role = m["role"] if m["role"] in ("user", "assistant", "system") else "user"
         msgs.append({"role": role, "content": m["text"]})
     return msgs
@@ -476,6 +480,34 @@ def _extract_stray_function_call(content: str, tool_by_name: dict):
     return None
 
 
+def _extract_stray_command_call(content: str, tool_by_name: dict):
+    """Recover Mistral's parenthesized command notation.
+
+    Observed live: ``(web_search query 'flights from ...')``.  It names a real
+    exposed tool and parameter but is not JSON or Python-call syntax, so the two
+    structural recovery helpers above cannot see it.
+    """
+    match = re.search(
+        r"\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+"
+        r"(?:'([^']*)'|\"([^\"]*)\")\s*\)",
+        content,
+    )
+    if not match:
+        return None
+    name, parameter = match.group(1), match.group(2)
+    if name not in tool_by_name:
+        return None
+    properties = (
+        tool_by_name[name].get("function", {}).get("parameters", {})
+        .get("properties", {}) or {}
+    )
+    if parameter not in properties:
+        return None
+    return SimpleNamespace(function=SimpleNamespace(
+        name=name, arguments={parameter: match.group(3) or match.group(4) or ""}
+    ))
+
+
 def _looks_like_raw_tool_dump(text: str) -> bool:
     """True if `text` looks like a tool's raw JSON/dict return value rather
     than a prose sentence. A structural/format check (does this parse as data,
@@ -618,7 +650,9 @@ def _synthesize_from_trace(trace: list[dict]) -> str:
 
 async def run_turn(user_text: str, session_id: str | None = None, *,
                    model: str | None = None, max_steps: int = MAX_STEPS,
-                   on_event=None, label: str | None = None) -> dict:
+                   on_event=None, label: str | None = None,
+                   allowed_tool_names: set[str] | None = None,
+                   allowed_server_names: set[str] | None = None) -> dict:
     """
     Run one full agent turn. Returns {reply, session_id, trace, steps, model, mode}.
     `on_event(ev)` — optional async callback fed {"type":"thinking","step":...}
@@ -663,7 +697,17 @@ async def run_turn(user_text: str, session_id: str | None = None, *,
     llm = AsyncClient()
     trace: list[dict] = []
 
-    async with MCPClientManager() as mcp:
+    # Starting every enabled MCP subprocess on every turn adds avoidable startup
+    # latency. The router knows the relevant integration, so start only those
+    # servers. None retains the full dynamic roster for direct/legacy callers.
+    server_specs = None
+    if allowed_server_names is not None:
+        server_specs = {
+            name: spec for name, spec in default_servers().items()
+            if name in allowed_server_names
+        }
+
+    async with MCPClientManager(servers=server_specs) as mcp:
         # If a previous turn's background extraction hasn't landed yet (e.g. this is
         # the first message of a brand-new session — startNewChat() is 100% client-
         # side, it never calls the backend, so "first message of a session we may
@@ -679,31 +723,25 @@ async def run_turn(user_text: str, session_id: str | None = None, *,
         # slow) — it exists to stop the app from hanging forever, not to cap
         # normal-case latency. drain_all() itself already fails fast (no wait) if
         # Neo4j is simply unreachable — see extractor.mem_reachable().
+        # Never drain the durable extraction backlog on the user-facing request.
+        # Extraction may require a separate model call per row and previously added
+        # up to 60 seconds before inference even began. Background extraction plus
+        # scheduled maintenance remain the durable retry paths.
         if wm.pending_count() > 0:
-            _t_drain = time.monotonic()
-            try:
-                await emit("Catching up on memory…")
-                import extractor  # type: ignore
-                drained = await asyncio.wait_for(
-                    asyncio.to_thread(extractor.drain_all), timeout=60.0)
-                logger.info("Pre-turn drain: %s (%.2fs)", drained, time.monotonic() - _t_drain)
-            except asyncio.TimeoutError:
-                logger.error("Pre-turn drain hung past 60s (Ollama/Neo4j likely wedged); "
-                             "continuing without it — check those services")
-            except Exception as e:  # noqa: BLE001 — never let a drain failure break the turn
-                logger.error("Pre-turn drain failed: %s", e)
+            logger.info("Memory extraction backlog pending; leaving it to background maintenance")
 
         # Pre-load the user's long-term memory (their facts + known contacts' emails)
         # into the system prompt so a small tool-calling model can resolve "email X"
         # directly from context instead of having to chain a separate recall step.
         context = ""
         _t0 = time.monotonic()
-        try:
-            await emit("Recalling what I know…")
-            recall = await mcp.call_tool("recall", {"subject_key": _OWNER})
-            context = _format_context(recall)
-        except Exception:  # noqa: BLE001 — recall is best-effort
-            pass
+        if "orbix-memory" in mcp.sessions:
+            try:
+                await emit("Recalling what I know…")
+                recall = await mcp.call_tool("recall", {"subject_key": _OWNER})
+                context = _format_context(recall)
+            except Exception:  # noqa: BLE001 — recall is best-effort
+                pass
         logger.info("LATENCY recall (pre-load): %.2fs", time.monotonic() - _t0)
 
         # The brain may READ anything (memory recall, list emails/calendar, web search,
@@ -713,7 +751,9 @@ async def run_turn(user_text: str, session_id: str | None = None, *,
         # them out avoids races/duplication. Whatever servers the user has enabled is
         # exactly the tool surface here, so integrations compose in any order.
         def _allowed(name: str) -> bool:
-            return mcp.is_readonly(name) or mcp.server_of(name) != _MEMORY_SERVER
+            memory_policy = mcp.is_readonly(name) or mcp.server_of(name) != _MEMORY_SERVER
+            scope_policy = allowed_tool_names is None or name in allowed_tool_names
+            return memory_policy and scope_policy
         tools = [t for t in mcp.ollama_tools()
                  if _allowed(t["function"]["name"])]
         _tool_names = {t["function"]["name"] for t in tools}
@@ -749,7 +789,8 @@ async def run_turn(user_text: str, session_id: str | None = None, *,
                     content = ""
             if not calls and content:
                 stray = (_extract_stray_tool_call(content, _tool_names)
-                         or _extract_stray_function_call(content, _tool_by_name))
+                         or _extract_stray_function_call(content, _tool_by_name)
+                         or _extract_stray_command_call(content, _tool_by_name))
                 if stray:
                     logger.info("Recovered stray tool call from plain text: %s", stray.function.name)
                     calls = [stray]
@@ -788,6 +829,19 @@ async def run_turn(user_text: str, session_id: str | None = None, *,
                     await emit(outcome)
                 messages.append({"role": "tool", "tool_name": name,
                                  "content": json.dumps(result, default=str)})
+
+            # A round containing only write/action calls already has everything
+            # needed for a truthful confirmation in the verified trace. Avoid a
+            # second full model generation whose only job would be to say "done".
+            terminal_write_tools = {
+                "send_email", "create_meet", "create_calendar_event",
+                "delete_calendar_event", "add_task", "complete_task",
+                "delete_task", "write_file", "gh_create_issue",
+                "notion_append_text", "slack_post_message",
+            }
+            if calls and all(c.function.name in terminal_write_tools for c in calls):
+                reply = _synthesize_from_trace(trace)
+                break
 
             if mode == "legacy":
                 # This model's template has no {{ range .Messages }} / tool-result
@@ -856,10 +910,38 @@ async def run_turn(user_text: str, session_id: str | None = None, *,
                     logger.warning("Unfulfilled-promise follow-up failed: %s", e)
 
     # Small models occasionally finish with empty text right after a forced follow-up
-    # tool call. Never return a blank turn: synthesize a confirmation from the actions
-    # that actually succeeded (falls back to a generic ack if nothing to report).
+    # tool call. Never return a blank turn, and never say "Done" unless the trace
+    # proves an action actually succeeded.
     if not reply.strip():
-        reply = _synthesize_from_trace(trace) or "Done."
+        reply = _synthesize_from_trace(trace) or (
+            "I couldn't generate a reliable response for that request. "
+            "No external action was confirmed."
+        )
+
+    # Never show the private system prompt. A small local model has occasionally
+    # echoed its opening instructions (including the internal owner memory key)
+    # after a vague follow-up such as "go ahead".
+    if ("persistent long-term memory stored in a knowledge graph" in reply.lower()
+            and "memory key 'user:self'" in reply.lower()):
+        reply = _synthesize_from_trace(trace) or (
+            "I lost the context for that follow-up. Please repeat the request; "
+            "no external action was confirmed."
+        )
+
+    # Never expose invented placeholders as if they were action results. If real
+    # tools succeeded, replace the model prose with confirmations synthesized from
+    # the trace. If no tool ran, say that plainly.
+    placeholder_re = re.compile(
+        r"\[(?:google\s+meet\s+)?link\]|\{\s*(?:meet_link|event_id|emailed)\b|"
+        r"\b(?:meet_link|event_id)\b(?=\s*[,}:])",
+        re.IGNORECASE,
+    )
+    if placeholder_re.search(reply):
+        verified = _synthesize_from_trace(trace)
+        reply = verified or (
+            "I couldn't complete that action because no tool call was confirmed. "
+            "No meeting, email, or other external action was created."
+        )
 
     # Occasionally the model echoes a literal "assistant" role-header as plain
     # text at the start of its reply (e.g. "assistant\n\nI have completed...") —

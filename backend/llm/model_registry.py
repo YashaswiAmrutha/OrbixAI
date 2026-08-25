@@ -35,6 +35,11 @@ _lock = Lock()
 # actually branches on this value.
 CATALOG: list[dict] = [
     {
+        "id": "mistral:latest",
+        "label": "Local — Mistral 7B",
+        "tool_calling": "native",
+    },
+    {
         "id": "llama3.1:8b",
         "label": "Base — Llama 3.1 8B",
         "tool_calling": "native",
@@ -167,3 +172,20 @@ def describe_active() -> dict:
     active = get_active()
     entry = _BY_ID.get(active, {"id": active, "label": active, "tool_calling": "native"})
     return {**entry, "active": True}
+
+
+def get_instruction_model() -> str:
+    """Model for ordinary structured/prose generation such as itineraries.
+
+    Follow the model selected in the UI instead of silently hardcoding Llama.
+    The legacy fine-tune is the sole exception: its prompt template produces
+    tool-call plans rather than normal prose, so use a configurable native
+    instruction-model fallback for that catalog entry.
+    """
+    # ORBIX_TRAVEL_MODEL used to pin this pipeline independently of the UI.
+    # That made the model dropdown misleading and caused unnecessary cold model
+    # swaps. The active registry is now the single source of truth.
+    active = get_active()
+    if tool_calling_mode(active) == "legacy":
+        return os.environ.get("ORBIX_INSTRUCTION_FALLBACK_MODEL", "mistral:latest")
+    return active

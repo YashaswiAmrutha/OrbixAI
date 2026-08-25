@@ -19,6 +19,7 @@ import asyncio
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Callable
 from llm.ollama_client import generate_response
+from llm.ollama_options import ollama_options
 
 from mcp.client.session import ClientSession
 from mcp.client.stdio import stdio_client, StdioServerParameters
@@ -102,6 +103,83 @@ _TRAVEL_SCHEMA = {
 }
 
 
+_NUMBER_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+}
+
+
+def _fast_travel_entities(query: str) -> Dict | None:
+    """Parse common travel shapes without spending a full model call.
+
+    This is deliberately pattern-based rather than prompt-specific: it handles
+    arbitrary origins, destinations, dates and itinerary lengths. Ambiguous
+    language still falls back to structured LLM extraction below.
+    """
+    from orchestration.flight_fastpath import parse_flight_request, _parse_date, _clean_city
+    from zoneinfo import ZoneInfo
+
+    now = datetime.now(ZoneInfo("Asia/Kolkata"))
+    flight = parse_flight_request(query, now=now)
+
+    from_city = to_city = check_in = None
+    adults = 1
+    if flight and not flight.get("missing"):
+        from_city = flight.get("from_city")
+        to_city = flight.get("to_city")
+        check_in = flight.get("departure_date")
+        adults = flight.get("adults", 1)
+
+    if not to_city:
+        destination_patterns = (
+            r"\b(?:explore|visit)\s+([A-Za-z][A-Za-z .'-]*?)"
+            r"(?=\s+(?:on|for|from|starting|with|including|and)\b|[,.?!]|$)",
+            r"\bitinerar(?:y|ies)\s+(?:for|to|in)\s+([A-Za-z][A-Za-z .'-]*?)"
+            r"(?=\s+(?:on|for|from|starting|with|including|and)\b|[,.?!]|$)",
+            r"\b(?:trip|vacation|travel)\s+to\s+([A-Za-z][A-Za-z .'-]*?)"
+            r"(?=\s+(?:on|for|from|starting|with|including|and)\b|[,.?!]|$)",
+        )
+        for pattern in destination_patterns:
+            match = re.search(pattern, query, re.I)
+            if match:
+                to_city = _clean_city(match.group(1))
+                break
+
+    days = None
+    days_match = re.search(r"\b(\d{1,2})\s*[- ]?\s*days?\b", query, re.I)
+    if days_match:
+        days = int(days_match.group(1))
+    else:
+        word_match = re.search(
+            r"\b(one|two|three|four|five|six|seven|eight|nine|ten)\s*[- ]?\s*days?\b",
+            query,
+            re.I,
+        )
+        if word_match:
+            days = _NUMBER_WORDS[word_match.group(1).lower()]
+
+    if not check_in:
+        parsed_date = _parse_date(query, now)
+        check_in = parsed_date.isoformat() if parsed_date else None
+
+    if not to_city:
+        return None
+    days = max(1, min(days or 3, 30))
+    check_out = None
+    if check_in:
+        check_out = (
+            datetime.strptime(check_in, "%Y-%m-%d") + timedelta(days=days)
+        ).strftime("%Y-%m-%d")
+    return {
+        "from_city": from_city,
+        "to_city": to_city,
+        "check_in": check_in,
+        "check_out": check_out,
+        "num_nights": days,
+        "num_adults": adults,
+    }
+
+
 def extract_travel_entities(query: str, emit=None) -> Dict:
     """
     Extract travel details as strict JSON via Ollama structured output.
@@ -116,13 +194,20 @@ def extract_travel_entities(query: str, emit=None) -> Dict:
         if emit:
             emit(msg)
 
+    fast = _fast_travel_entities(query)
+    if fast is not None:
+        _emit("Travel details recognized…")
+        logger.info("[Travel] fast extracted entities: %s", fast)
+        return fast
+
     _emit("Extracting travel details…")
     # "llama3.2:3b" is not a locally-pulled tag on this machine (`ollama list`
     # only has llama3.2:latest) — that silently broke this call every time
     # (caught below, returning empty entities), which is why travel queries with
     # a perfectly clear destination were failing with "could not determine
     # destination". llama3.1:8b is confirmed present and used elsewhere.
-    model = os.environ.get("ORBIX_TRAVEL_MODEL", "llama3.1:8b")
+    from llm.model_registry import get_instruction_model
+    model = get_instruction_model()
     try:
         resp = ollama.chat(
             model=model,
@@ -131,7 +216,7 @@ def extract_travel_entities(query: str, emit=None) -> Dict:
                 {"role": "user", "content": query},
             ],
             format=_TRAVEL_SCHEMA,
-            options={"temperature": 0, "num_gpu": int(os.environ.get("OLLAMA_NUM_GPU", "0"))},
+            options=ollama_options(temperature=0),
         )
         data = json.loads(resp["message"]["content"])
         logger.info("[Travel] extracted entities: %s", data)
@@ -337,9 +422,14 @@ async def plan_trip(query: str, emit: Callable[[str], None] = None) -> Dict:
                 _emit("Skipping flight search")
 
             # Step 3: Hotels
-            hotel_decision, hotel_params = route_hotel_api(
-                entities,
-                bool(result["flights"])
+            wants_hotel = bool(re.search(
+                r"\b(hotels?|stay|stays|accommodation|lodging|rooms?)\b",
+                query,
+                re.I,
+            ))
+            hotel_decision, hotel_params = (
+                route_hotel_api(entities, bool(result["flights"]))
+                if wants_hotel else ("SKIP_HOTEL", None)
             )
 
             hotel_summary = None
@@ -386,10 +476,14 @@ async def plan_trip(query: str, emit: Callable[[str], None] = None) -> Dict:
             # Step 4: Attractions
             _emit(f"Finding attractions in {to_city}...")
 
-            attractions = await get_attractions_mcp(
-                session,
-                to_city
-            )
+            try:
+                attractions = await asyncio.wait_for(
+                    get_attractions_mcp(session, to_city),
+                    timeout=12,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("[Travel] attraction search timed out")
+                attractions = []
 
             print("ATTRACTIONS TYPE:", type(attractions))
             print("ATTRACTIONS DATA:", attractions)
@@ -437,5 +531,3 @@ async def plan_trip(query: str, emit: Callable[[str], None] = None) -> Dict:
             _emit("Itinerary ready!")
 
             return result
-
-
